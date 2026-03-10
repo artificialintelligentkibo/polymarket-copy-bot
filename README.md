@@ -17,6 +17,10 @@ A **Polymarket copy bot** for copy trading on Polymarket prediction markets. Wat
 - Polymarket account tied to the same EOA/private key
 - Polygon RPC URL (QuickNode recommended)
 
+## Region Restrictions
+
+Polymarket restricts access in some regions. **If you are in a restricted region, the bot will not work** — you will see connection or Cloudflare/geo errors. In that case, route traffic through a proxy or VPN (many free proxy services are available). Run the bot from an environment where Polymarket is accessible.
+
 ## Credentials
 
 - The bot derives/creates User CLOB credentials from `PRIVATE_KEY` at startup.
