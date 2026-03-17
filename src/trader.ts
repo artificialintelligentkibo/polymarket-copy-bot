@@ -37,6 +37,34 @@ interface ApiCredentials {
   passphrase: string;
 }
 
+export function normalizeFeeRateBps(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return raw;
+  }
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return 0;
+    }
+
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  if (raw && typeof raw === 'object') {
+    const candidate =
+      (raw as Record<string, unknown>).fee_rate_bps ??
+      (raw as Record<string, unknown>).feeRateBps ??
+      (raw as Record<string, unknown>).fee_rate ??
+      (raw as Record<string, unknown>).feeRate;
+
+    return normalizeFeeRateBps(candidate);
+  }
+
+  return 0;
+}
+
 export interface CopyExecutionResult {
   orderId: string;
   copyNotional: number;
@@ -166,7 +194,7 @@ export class TradeExecutor {
         tickSize,
         tickSizeStr,
         negRisk,
-        feeRateBps,
+        feeRateBps: normalizeFeeRateBps(feeRateBps),
         timestamp: now,
       };
 
@@ -445,10 +473,11 @@ export class TradeExecutor {
   ): Promise<CopyExecutionResult> {
     await this.validateBalanceOrShares(originalTrade.side, copyNotional, originalTrade.tokenId);
 
-    const [orderbook, orderOpts] = await Promise.all([
+    const [orderbook, marketMetadata] = await Promise.all([
       this.clobClient.getOrderBook(originalTrade.tokenId),
-      this.getOrderOptions(originalTrade.tokenId),
+      this.getMarketMetadata(originalTrade.tokenId),
     ]);
+    const orderOpts = this.getOrderOptionsFromMetadata(marketMetadata);
 
     this.ensureLiquidity(orderbook, originalTrade.side);
 
@@ -460,6 +489,7 @@ export class TradeExecutor {
 
     logger.info(`   Limit price: ${validatedPrice.toFixed(4)}`);
     logger.info(`   Copy shares: ${copyShares}`);
+    logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
     const response = await this.clobClient.createAndPostOrder(
       {
@@ -467,7 +497,7 @@ export class TradeExecutor {
         price: validatedPrice,
         size: copyShares,
         side: originalTrade.side as Side,
-        feeRateBps: 0,
+        feeRateBps: marketMetadata.feeRateBps,
       },
       orderOpts,
       OrderType.GTC
@@ -497,10 +527,11 @@ export class TradeExecutor {
   ): Promise<CopyExecutionResult> {
     await this.validateBalanceOrShares(originalTrade.side, copyNotional, originalTrade.tokenId);
 
-    const [orderbook, orderOpts] = await Promise.all([
+    const [orderbook, marketMetadata] = await Promise.all([
       this.clobClient.getOrderBook(originalTrade.tokenId),
-      this.getOrderOptions(originalTrade.tokenId),
+      this.getMarketMetadata(originalTrade.tokenId),
     ]);
+    const orderOpts = this.getOrderOptionsFromMetadata(marketMetadata);
 
     this.ensureLiquidity(orderbook, originalTrade.side);
 
@@ -512,6 +543,7 @@ export class TradeExecutor {
 
     logger.info(`   Market price: ${validatedPrice.toFixed(4)}`);
     logger.info(`   Copy shares: ${copyShares}`);
+    logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
     const orderTypeEnum = orderType === 'FOK' ? OrderType.FOK : OrderType.FAK;
     const response = await this.clobClient.createAndPostMarketOrder(
@@ -520,7 +552,7 @@ export class TradeExecutor {
         amount: originalTrade.side === 'BUY' ? copyNotional : copyShares,
         price: validatedPrice,
         side: originalTrade.side as Side,
-        feeRateBps: 0,
+        feeRateBps: marketMetadata.feeRateBps,
         orderType: orderTypeEnum,
       },
       orderOpts,
@@ -712,8 +744,7 @@ export class TradeExecutor {
     return entry?.[1] || '0';
   }
 
-  private async getOrderOptions(tokenId: string): Promise<{ tickSize: any; negRisk: boolean }> {
-    const metadata = await this.getMarketMetadata(tokenId);
+  private getOrderOptionsFromMetadata(metadata: MarketMetadata): { tickSize: any; negRisk: boolean } {
     return {
       tickSize: metadata.tickSizeStr as any,
       negRisk: metadata.negRisk,

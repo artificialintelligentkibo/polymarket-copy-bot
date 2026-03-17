@@ -247,6 +247,16 @@ Set `SIGNATURE_TYPE` to the mode that matches your Polymarket account:
 
 The bot intentionally requires an explicit `SIGNATURE_TYPE` in `PROXY` mode so it never guesses the wrong proxy auth flow.
 
+### `invalid user provided fee rate`
+
+Some Polymarket markets are fee-enabled and reject orders that send `feeRateBps=0`.
+
+This bot now fetches `feeRateBps` dynamically per token/market before signing and posting each order. If you still see this error:
+
+- update to the latest code from this fork,
+- restart the bot so it uses the patched order flow,
+- check the runtime logs for the printed `Fee rate bps` value on the failing order.
+
 ## Notes
 
 - Trade detection logic is unchanged.
