@@ -1,4 +1,5 @@
 import { config } from './config.js';
+import { logger } from './logger.js';
 import type { Trade } from './monitor.js';
 import { PositionTracker } from './positions.js';
 
@@ -11,9 +12,13 @@ export class RiskManager {
   private sessionNotional = 0;
   private readonly positions: PositionTracker;
   private readonly minCopySizeUsd = 0.5;
+  private readonly snapshotInterval: NodeJS.Timeout;
 
   constructor(positions: PositionTracker) {
     this.positions = positions;
+    this.snapshotInterval = setInterval(() => {
+      this.logRiskSnapshot();
+    }, 30_000);
   }
 
   checkTrade(trade: Trade, copyNotional: number): RiskCheckResult {
@@ -65,5 +70,21 @@ export class RiskManager {
 
   getSessionNotional(): number {
     return this.sessionNotional;
+  }
+
+  private logRiskSnapshot(): void {
+    const openPositions = this.positions.getOpenPositions();
+    const openSummary = openPositions.length
+      ? openPositions
+          .map(
+            (position) =>
+              `${position.market}:${position.outcome}=${position.notional.toFixed(2)}USDC/${position.shares.toFixed(4)}sh`
+          )
+          .join(' | ')
+      : 'none';
+
+    logger.info(
+      `[risk] sessionNotional=${this.sessionNotional.toFixed(2)} openPositions=${openPositions.length} ${openSummary}`
+    );
   }
 }

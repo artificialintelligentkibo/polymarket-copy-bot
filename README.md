@@ -176,6 +176,37 @@ Run tests:
 npm test
 ```
 
+## How to run in simulation mode
+
+Use simulation mode when you want to reverse-engineer a target wallet without placing any real orders.
+
+What happens in this mode:
+
+- the bot still detects target wallet trades through REST/WebSocket
+- no live `createAndPostOrder` or `createAndPostMarketOrder` call is sent to Polymarket
+- every detected target trade is appended to `logs/trades_YYYY-MM-DD.jsonl`
+- each JSONL record includes the target trade metadata, crypto spot context from Binance 1m candles, and the current local unrealized PnL snapshot
+- if no live signer key is configured, the bot falls back to an ephemeral local signer because simulation mode is read-only
+
+Example:
+
+```bash
+SIMULATION_MODE=true
+TARGET_WALLET=0x70ec235a31eb35f243e2618d6ea3b5b8962bbb5d
+```
+
+Start it:
+
+```bash
+npm start
+```
+
+Expected output:
+
+- console banner `SIMULATION MODE ACTIVE — no real trades`
+- append-only trade logs inside `logs/`
+- no real on-chain or CLOB order submission
+
 ## Авто-погашення та фіксація прибутку
 
 Бот підтримує фоновий цикл керування вже відкритими позиціями.

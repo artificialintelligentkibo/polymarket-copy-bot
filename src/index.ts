@@ -4,6 +4,7 @@ import { TradeMonitor, type Trade } from './monitor.js';
 import { PositionTracker } from './positions.js';
 import { RiskManager } from './risk-manager.js';
 import { TradeExecutor, TradeSkipError } from './trader.js';
+import { ensureLogsDirectory } from './trade-logger.js';
 import { WebSocketMonitor } from './websocket-monitor.js';
 
 class PolymarketCopyBot {
@@ -31,6 +32,11 @@ class PolymarketCopyBot {
   }
 
   async initialize(): Promise<void> {
+    await ensureLogsDirectory();
+    if (config.SIMULATION_MODE) {
+      console.log('🚀 SIMULATION MODE ACTIVE — no real trades');
+    }
+
     logger.info('Polymarket Copy Trading Bot');
     logger.info('================================');
     logger.info(`Target wallet: ${config.targetWallet}`);
@@ -38,6 +44,7 @@ class PolymarketCopyBot {
     logger.info(`Max trade size: ${config.trading.maxTradeSize} USDC`);
     logger.info(`Order type: ${config.trading.orderType}`);
     logger.info(`Copy sells: ${config.trading.copySells ? 'Yes' : 'No (BUY only)'}`);
+    logger.info(`Simulation mode: ${config.SIMULATION_MODE ? 'Enabled' : 'Disabled'}`);
     logger.info(`WebSocket: ${config.monitoring.useWebSocket ? 'Enabled' : 'Disabled'}`);
     if (config.risk.maxSessionNotional > 0 || config.risk.maxPerMarketNotional > 0) {
       logger.info(
@@ -137,6 +144,10 @@ class PolymarketCopyBot {
     logger.info(`   Size: ${trade.size} USDC @ ${trade.price.toFixed(3)}`);
     logger.info(`   Token ID: ${trade.tokenId}`);
     logger.info('='.repeat(50));
+
+    if (config.SIMULATION_MODE) {
+      await this.executor.logTargetTradeSimulation(trade);
+    }
 
     if (trade.side === 'SELL' && !config.trading.copySells) {
       logger.warn('Skipping SELL trade (COPY_SELLS=false, BUY-only mode)');

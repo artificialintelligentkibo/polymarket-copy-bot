@@ -28,12 +28,20 @@ export function getActiveSignatureType(config: AppConfig): SignatureType {
     return 0;
   }
 
+  if (config.SIMULATION_MODE) {
+    return 0;
+  }
+
   throw new Error(
     'PROXY mode requires SIGNATURE_TYPE to be set explicitly (1 for POLY_PROXY or 2 for GNOSIS_SAFE).'
   );
 }
 
 export function resolveSignerAddress(config: AppConfig): string {
+  if (!config.signerPrivateKey && config.SIMULATION_MODE) {
+    return ethers.constants.AddressZero;
+  }
+
   try {
     const wallet = new ethers.Wallet(config.signerPrivateKey);
     return ethers.utils.getAddress(wallet.address);
@@ -43,6 +51,10 @@ export function resolveSignerAddress(config: AppConfig): string {
 }
 
 export function resolveFunderAddress(config: AppConfig, signerAddress?: string): string {
+  if (config.SIMULATION_MODE && !config.auth.funderAddress) {
+    return ethers.constants.AddressZero;
+  }
+
   if (config.auth.mode === 'PROXY') {
     return normalizeAddress(config.auth.funderAddress, 'FUNDER_ADDRESS');
   }

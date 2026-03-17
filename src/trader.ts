@@ -14,6 +14,7 @@ import {
 import { logger } from './logger.js';
 import type { Trade, TradeOutcome } from './monitor.js';
 import { PositionTracker, type PositionState } from './positions.js';
+import { logSimulatedTrade } from './trade-logger.js';
 
 const DATA_API_POSITIONS = 'https://data-api.polymarket.com/positions';
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -54,6 +55,13 @@ interface ExecutionSize {
 interface FallbackLimitOptions {
   forcedPrice?: number;
   allowEmptyBook?: boolean;
+}
+
+interface SimulationMarketContext {
+  marketTitle: string;
+  marketConditionId: string;
+  slotStart: string;
+  side: 'YES' | 'NO' | 'UNKNOWN';
 }
 
 export function normalizeFeeRateBps(raw: unknown): number {
@@ -120,6 +128,7 @@ export class Trader {
   private initialized = false;
   private autoRedeemTimer?: ReturnType<typeof setInterval>;
   private autoRedeemCycleRunning = false;
+  private readonly simulationMarketContextCache = new Map<string, SimulationMarketContext>();
   private readonly ERC20_ABI = [
     'function balanceOf(address) view returns (uint256)',
     'function allowance(address owner, address spender) view returns (uint256)',
@@ -138,7 +147,11 @@ export class Trader {
   constructor(positions: PositionTracker) {
     this.positions = positions;
     this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
-    this.signerWallet = new ethers.Wallet(config.signerPrivateKey, this.provider);
+    this.signerWallet = (
+      config.signerPrivateKey
+        ? new ethers.Wallet(config.signerPrivateKey, this.provider)
+        : ethers.Wallet.createRandom().connect(this.provider)
+    ) as ethers.Wallet;
     this.executionContext = createExecutionContext(config);
     this.clobClient = this.createUnauthenticatedClient();
     this.marketClient = new PolymarketClient({
@@ -156,7 +169,10 @@ export class Trader {
       getBestBidPrice: this.marketClient.getBestBidPrice.bind(this.marketClient),
     });
 
-    if (config.trading.autoRedeem) {
+    if (
+      !config.SIMULATION_MODE &&
+      (config.trading.autoRedeem || config.trading.autoSellThreshold > 0)
+    ) {
       this.start();
     }
   }
@@ -164,6 +180,17 @@ export class Trader {
   async initialize(): Promise<void> {
     logger.info('Initializing trader...');
     this.logExecutionSummary();
+
+    if (config.SIMULATION_MODE) {
+      this.initialized = true;
+      logger.warn('SIMULATION_MODE is active: skipping API credential generation and approval checks');
+      if (!config.signerPrivateKey) {
+        logger.info('Simulation mode is using an ephemeral local signer because no live signer key was provided');
+      }
+      logger.info('Trader initialized');
+      logger.info(`   Market cache: Enabled (TTL: ${this.CACHE_TTL / 1000}s)`);
+      return;
+    }
 
     try {
       await this.deriveAndReinitApiKeys();
@@ -201,10 +228,19 @@ export class Trader {
   }
 
   start(): void {
+    if (config.SIMULATION_MODE) {
+      logger.info('Simulation mode: auto redeem/sell background task is disabled');
+      return;
+    }
     this.startAutoRedeemAndSell();
   }
 
   startAutoRedeemAndSell(): void {
+    if (config.SIMULATION_MODE) {
+      logger.info('Simulation mode: auto redeem/sell background task is disabled');
+      return;
+    }
+
     if (this.autoRedeemTimer) {
       return;
     }
@@ -213,15 +249,20 @@ export class Trader {
       `Starting auto redeem/sell background task (${config.trading.redeemIntervalMs}ms interval, sell threshold ${config.trading.autoSellThreshold})`
     );
 
-    this.autoRedeemTimer = setInterval(() => {
-      const openPositions = this.positions.getOpenPositions();
-      console.log(
-        `[AUTO TICK ${new Date().toISOString()}] positions: ${openPositions.length} | checking sell threshold ${config.trading.autoSellThreshold}`
-      );
-      void this.runAutoRedeemAndSellCycle(openPositions);
-    }, config.trading.redeemIntervalMs);
+    const boundTick = this.runAutoRedeemAndSellTick.bind(this);
+    this.autoRedeemTimer = setInterval(boundTick, config.trading.redeemIntervalMs);
 
-    this.autoRedeemTimer.unref?.();
+    console.log(
+      `✅ Auto redeem/sell task STARTED with interval ${config.trading.redeemIntervalMs}ms`
+    );
+  }
+
+  private runAutoRedeemAndSellTick(): void {
+    const openPositions = this.positions.getOpenPositions();
+    console.log(
+      `[AUTO TICK ${new Date().toISOString()}] running | open positions: ${openPositions.length} | threshold: ${config.trading.autoSellThreshold}`
+    );
+    void this.runAutoRedeemAndSellCycle(openPositions);
   }
 
   calculateCopySize(originalSize: number): number {
@@ -349,6 +390,34 @@ export class Trader {
     return this.fetchPositionsFromDataApi();
   }
 
+  async logTargetTradeSimulation(trade: Trade): Promise<void> {
+    try {
+      const marketContext = await this.resolveSimulationMarketContext(trade);
+      const outcome = marketContext.side === 'UNKNOWN'
+        ? this.normalizeOutcome(trade.outcome)
+        : marketContext.side;
+
+      await logSimulatedTrade({
+        timestamp_ms: trade.timestamp,
+        market_title: marketContext.marketTitle,
+        market_condition_id: marketContext.marketConditionId || trade.market,
+        slot_start: marketContext.slotStart,
+        action: trade.side,
+        side: outcome,
+        token_price: trade.price,
+        shares: this.calculateSharesFromNotional(trade.size, trade.price),
+        usdc_amount: trade.size,
+        target_tx_hash_or_id: trade.txHash,
+        simulated_pnl_if_closed_now: this.estimateUnrealizedPnl(trade.tokenId, trade.price),
+        is_copy_from_target: true,
+      });
+    } catch (error: any) {
+      logger.warn(
+        `Could not write simulation trade log for ${trade.txHash}: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
   async cancelAllOrders(): Promise<void> {
     try {
       await this.clobClient.cancelAll();
@@ -391,6 +460,7 @@ export class Trader {
     logger.info(`   Signer address: ${this.executionContext.signerAddress}`);
     logger.info(`   Funder address: ${this.executionContext.funderAddress}`);
     logger.info(`   Signature type: ${this.executionContext.signatureType}`);
+    logger.info(`   Simulation mode: ${config.SIMULATION_MODE ? 'enabled' : 'disabled'}`);
     logger.info(`   Balance check address: ${getBalanceCheckAddress(this.executionContext)}`);
     logger.info(`   Allowance check address: ${getAllowanceCheckAddress(this.executionContext)}`);
     logger.info(`   Position check address: ${getPositionCheckAddress(this.executionContext)}`);
@@ -776,6 +846,20 @@ export class Trader {
     const validatedPrice = await this.validatePrice(executionPrice, originalTrade.tokenId);
     const executionSize = this.resolveExecutionSize(originalTrade, requestedNotional, validatedPrice);
 
+    if (config.SIMULATION_MODE) {
+      logger.info(
+        `SIMULATION_MODE: skipping live LIMIT order for ${originalTrade.tokenId} (${originalTrade.side} ${executionSize.copyShares.toFixed(4)} @ ${validatedPrice.toFixed(4)})`
+      );
+      return {
+        orderId: `sim-limit-${originalTrade.tokenId}-${Date.now()}`,
+        copyNotional: executionSize.copyNotional,
+        copyShares: executionSize.copyShares,
+        price: validatedPrice,
+        side: originalTrade.side,
+        tokenId: originalTrade.tokenId,
+      };
+    }
+
     if (originalTrade.side === 'BUY') {
       await this.validateBalance(executionSize.copyNotional, originalTrade.tokenId);
       if (!options.allowEmptyBook) {
@@ -858,6 +942,20 @@ export class Trader {
     const validatedPrice = await this.validatePrice(marketPrice, originalTrade.tokenId);
     const executionSize = this.resolveExecutionSize(originalTrade, requestedNotional, validatedPrice);
 
+    if (config.SIMULATION_MODE) {
+      logger.info(
+        `SIMULATION_MODE: skipping live MARKET order for ${originalTrade.tokenId} (${originalTrade.side} ${executionSize.copyShares.toFixed(4)} @ ${validatedPrice.toFixed(4)})`
+      );
+      return {
+        orderId: `sim-market-${originalTrade.tokenId}-${Date.now()}`,
+        copyNotional: executionSize.copyNotional,
+        copyShares: executionSize.copyShares,
+        price: validatedPrice,
+        side: originalTrade.side,
+        tokenId: originalTrade.tokenId,
+      };
+    }
+
     if (originalTrade.side === 'BUY') {
       await this.validateBalance(executionSize.copyNotional, originalTrade.tokenId);
     }
@@ -908,6 +1006,13 @@ export class Trader {
     observedBestBid?: number,
     observedShares?: number
   ): Promise<void> {
+    if (config.SIMULATION_MODE) {
+      logger.info(
+        `SIMULATION_MODE: skipping managed auto-sell for ${position.tokenId} while reverse-engineering target trades`
+      );
+      return;
+    }
+
     const availableShares = observedShares ?? this.positions.getWinningShares(position.tokenId);
     if (availableShares <= 0) {
       throw new TradeSkipError(`Auto-sell skipped for ${position.tokenId}: no remaining shares`);
@@ -1451,6 +1556,159 @@ export class Trader {
       maxPriorityFeePerGas: maxPriority,
       maxFeePerGas: maxFee,
     };
+  }
+
+  private estimateUnrealizedPnl(tokenId: string, markPrice: number): number {
+    const position = this.positions.getPosition(tokenId);
+    if (!position || position.shares <= 0 || position.avgPrice <= 0) {
+      return 0;
+    }
+
+    return (markPrice - position.avgPrice) * position.shares;
+  }
+
+  private async resolveSimulationMarketContext(trade: Trade): Promise<SimulationMarketContext> {
+    const marketConditionId =
+      trade.marketConditionId ||
+      trade.market ||
+      this.positions.getPosition(trade.tokenId)?.market ||
+      'UNKNOWN';
+    const cacheKey = `${marketConditionId}:${trade.tokenId}`;
+    const cached = this.simulationMarketContextCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    let marketTitle = trade.marketTitle || marketConditionId || trade.tokenId;
+    let slotStart = trade.slotStart || this.extractSlotStartFromTitle(marketTitle) || 'UNKNOWN';
+    let side = this.normalizeOutcome(trade.outcome);
+
+    if (marketConditionId && marketConditionId !== 'UNKNOWN') {
+      const market = await this.marketClient.getMarket(marketConditionId);
+      marketTitle = this.extractMarketTitleFromApi(market, marketTitle);
+      slotStart =
+        trade.slotStart ||
+        this.extractSlotStartFromMarket(market, marketTitle) ||
+        slotStart;
+      side = this.resolveOutcomeForToken(market, trade.tokenId, side);
+    }
+
+    const context: SimulationMarketContext = {
+      marketTitle,
+      marketConditionId,
+      slotStart,
+      side,
+    };
+    this.simulationMarketContextCache.set(cacheKey, context);
+    return context;
+  }
+
+  private extractMarketTitleFromApi(market: any, fallback: string): string {
+    const candidates = [
+      market?.question,
+      market?.title,
+      market?.marketTitle,
+      market?.market_title,
+      market?.slug,
+      market?.market_slug,
+      fallback,
+    ];
+
+    return (
+      candidates.find((candidate) => typeof candidate === 'string' && candidate.trim())?.trim() ||
+      fallback
+    );
+  }
+
+  private extractSlotStartFromMarket(market: any, marketTitle: string): string | undefined {
+    const timeCandidates = [
+      market?.startDate,
+      market?.start_date,
+      market?.startTime,
+      market?.start_time,
+    ];
+
+    for (const candidate of timeCandidates) {
+      const formatted = this.formatEasternTime(candidate);
+      if (formatted) {
+        return formatted;
+      }
+    }
+
+    return this.extractSlotStartFromTitle(marketTitle);
+  }
+
+  private extractSlotStartFromTitle(title: string): string | undefined {
+    const match = title.match(/\b\d{1,2}:\d{2}(?:AM|PM)\b/i);
+    return match?.[0]?.toUpperCase();
+  }
+
+  private formatEasternTime(rawValue: unknown): string | undefined {
+    if (typeof rawValue !== 'string' || !rawValue.trim()) {
+      return undefined;
+    }
+
+    const parsed = new Date(rawValue);
+    if (Number.isNaN(parsed.getTime())) {
+      return undefined;
+    }
+
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    })
+      .format(parsed)
+      .replace(' ', '')
+      .toUpperCase();
+  }
+
+  private resolveOutcomeForToken(
+    market: any,
+    tokenId: string,
+    fallback: 'YES' | 'NO' | 'UNKNOWN'
+  ): 'YES' | 'NO' | 'UNKNOWN' {
+    const tokens = Array.isArray(market?.tokens) ? market.tokens : [];
+    const tokenMatch = tokens.find((token: any) => {
+      const candidate =
+        token?.token_id || token?.tokenId || token?.asset_id || token?.assetId || '';
+      return String(candidate).trim() === tokenId;
+    });
+
+    if (tokenMatch?.outcome) {
+      return this.normalizeOutcome(String(tokenMatch.outcome));
+    }
+
+    const tokenIds = this.parseStringArray(market?.clobTokenIds || market?.tokenIds);
+    const outcomes = this.parseStringArray(market?.outcomes);
+    if (tokenIds.length === outcomes.length && tokenIds.length > 0) {
+      const index = tokenIds.findIndex((candidate) => candidate === tokenId);
+      if (index >= 0) {
+        return this.normalizeOutcome(outcomes[index] || fallback);
+      }
+    }
+
+    return fallback;
+  }
+
+  private parseStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value.map((entry) => String(entry));
+    }
+
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (Array.isArray(parsed)) {
+          return parsed.map((entry) => String(entry));
+        }
+      } catch {
+        return [];
+      }
+    }
+
+    return [];
   }
 
   private createSyntheticTrade(

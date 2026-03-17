@@ -27,6 +27,13 @@ const MIN_POSITION_NOTIONAL = 0.01;
 export class PositionTracker {
   private positions = new Map<string, PositionState>();
   private settlementHandlers: PositionSettlementHandlers = {};
+  private readonly snapshotInterval: NodeJS.Timeout;
+
+  constructor() {
+    this.snapshotInterval = setInterval(() => {
+      this.logOpenPositionsSnapshot();
+    }, 30_000);
+  }
 
   setSettlementHandlers(handlers: PositionSettlementHandlers): void {
     this.settlementHandlers = handlers;
@@ -272,5 +279,22 @@ export class PositionTracker {
   private parseNumber(value: any): number {
     const n = typeof value === 'string' ? parseFloat(value) : Number(value);
     return Number.isFinite(n) ? n : 0;
+  }
+
+  private logOpenPositionsSnapshot(): void {
+    const openPositions = this.getOpenPositions();
+    if (openPositions.length === 0) {
+      logger.info('[positions] open positions snapshot: none');
+      return;
+    }
+
+    const summary = openPositions
+      .map(
+        (position) =>
+          `${position.market}:${position.outcome} shares=${position.shares.toFixed(4)} notional=${position.notional.toFixed(2)} avg=${position.avgPrice.toFixed(4)}`
+      )
+      .join(' | ');
+
+    logger.info(`[positions] open positions snapshot (${openPositions.length}): ${summary}`);
   }
 }

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import { ensureLogsDirectory } from './trade-logger.js';
 
 export type TradeOutcome = 'YES' | 'NO' | 'UNKNOWN';
 
@@ -13,6 +14,9 @@ export interface Trade {
   price: number;
   size: number;
   outcome: TradeOutcome;
+  marketTitle?: string;
+  marketConditionId?: string;
+  slotStart?: string;
 }
 
 export class TradeMonitor {
@@ -20,6 +24,10 @@ export class TradeMonitor {
   private processedTradeIds: Set<string> = new Set();
 
   async initialize(): Promise<void> {
+    await ensureLogsDirectory();
+    if (config.SIMULATION_MODE) {
+      console.log('🚀 SIMULATION MODE ACTIVE — no real trades');
+    }
     this.lastProcessedTimestamp = Date.now();
     logger.info(`📊 Monitor initialized at ${new Date(this.lastProcessedTimestamp).toISOString()}`);
     logger.info(`   Will copy trades that occur AFTER this time`);
@@ -57,15 +65,22 @@ export class TradeMonitor {
   }
 
   private parseDataApiTrade(apiTrade: any): Trade {
+    const marketTitle = this.extractMarketTitle(apiTrade);
+    const marketConditionId = String(apiTrade.conditionId || apiTrade.market || '').trim();
+    const slotStart = this.extractSlotStart(apiTrade, marketTitle);
+
     return {
       txHash: apiTrade.transactionHash || apiTrade.id || `trade-${apiTrade.timestamp}`,
       timestamp: apiTrade.timestamp * 1000,
-      market: apiTrade.conditionId || apiTrade.market,
+      market: marketConditionId,
       tokenId: apiTrade.asset,
       side: apiTrade.side.toUpperCase() as 'BUY' | 'SELL',
       price: parseFloat(apiTrade.price),
       size: parseFloat(apiTrade.usdcSize || apiTrade.size),
       outcome: this.normalizeOutcome(apiTrade.outcome),
+      ...(marketTitle ? { marketTitle } : {}),
+      ...(marketConditionId ? { marketConditionId } : {}),
+      ...(slotStart ? { slotStart } : {}),
     };
   }
 
@@ -122,5 +137,32 @@ export class TradeMonitor {
       const entries = Array.from(this.processedTradeIds);
       this.processedTradeIds = new Set(entries.slice(-5000));
     }
+  }
+
+  private extractMarketTitle(apiTrade: any): string | undefined {
+    const candidates = [
+      apiTrade?.marketTitle,
+      apiTrade?.title,
+      apiTrade?.question,
+      apiTrade?.market_question,
+      apiTrade?.event_title,
+      apiTrade?.slug,
+    ];
+
+    return candidates.find((candidate) => typeof candidate === 'string' && candidate.trim())?.trim();
+  }
+
+  private extractSlotStart(apiTrade: any, marketTitle?: string): string | undefined {
+    const directCandidate = apiTrade?.slotStart || apiTrade?.slot_start || apiTrade?.startTime;
+    if (typeof directCandidate === 'string' && directCandidate.trim()) {
+      return directCandidate.trim();
+    }
+
+    if (!marketTitle) {
+      return undefined;
+    }
+
+    const match = marketTitle.match(/\b\d{1,2}:\d{2}(?:AM|PM)\b/i);
+    return match?.[0]?.toUpperCase();
   }
 }

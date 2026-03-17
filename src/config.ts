@@ -7,6 +7,7 @@ export type AuthMode = 'EOA' | 'PROXY';
 export type SignatureType = 0 | 1 | 2;
 
 export interface AppConfig {
+  SIMULATION_MODE: boolean;
   targetWallet: string;
   signerPrivateKey: string;
   polymarketGeoToken: string;
@@ -113,6 +114,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const signatureType = parseSignatureType(env.SIGNATURE_TYPE);
 
   return {
+    SIMULATION_MODE: env.SIMULATION_MODE === 'true',
     targetWallet: (env.TARGET_WALLET || '').trim(),
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: env.POLYMARKET_GEO_TOKEN || '',
@@ -166,13 +168,13 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('Missing required config: targetWallet');
   }
 
-  if (!candidate.signerPrivateKey) {
+  if (!candidate.signerPrivateKey && !candidate.SIMULATION_MODE) {
     throw new Error(
       'Missing required signer private key. Set SIGNER_PRIVATE_KEY or PRIVATE_KEY.'
     );
   }
 
-  if (candidate.auth.mode === 'PROXY') {
+  if (candidate.auth.mode === 'PROXY' && !candidate.SIMULATION_MODE) {
     if (!candidate.auth.funderAddress) {
       throw new Error('Missing required config for PROXY mode: FUNDER_ADDRESS');
     }
@@ -214,9 +216,14 @@ export function validateConfig(candidate: AppConfig = config): void {
   logger.info(`   Auth mode: ${candidate.auth.mode}`);
   logger.info(`   Signature type: ${signatureType}`);
   logger.info(`   Funder setting: ${funderLabel}`);
+  logger.info(`   Simulation mode: ${candidate.SIMULATION_MODE ? 'enabled' : 'disabled'}`);
   logger.info(`   Auto redeem enabled: ${candidate.trading.autoRedeem ? 'yes' : 'no'}`);
   logger.info(`   Auto sell threshold: ${candidate.trading.autoSellThreshold}`);
   logger.info(`   Redeem interval: ${candidate.trading.redeemIntervalMs}ms`);
+
+  if (candidate.SIMULATION_MODE) {
+    logger.warn('SIMULATION_MODE is enabled. No live order placement will be performed.');
+  }
 
   if (candidate.trading.autoRedeem && candidate.auth.mode === 'PROXY') {
     logger.warn(
