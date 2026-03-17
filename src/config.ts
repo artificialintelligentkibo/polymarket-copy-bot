@@ -3,68 +3,192 @@ import { logger } from './logger.js';
 
 dotenv.config();
 
-function parseCsv(value?: string): string[] {
-  if (!value) return [];
-  return value.split(',').map((v) => v.trim()).filter(Boolean);
+export type AuthMode = 'EOA' | 'PROXY';
+export type SignatureType = 0 | 1 | 2;
+
+export interface AppConfig {
+  targetWallet: string;
+  signerPrivateKey: string;
+  polymarketGeoToken: string;
+  rpcUrl: string;
+  chainId: number;
+  auth: {
+    mode: AuthMode;
+    signatureType?: SignatureType;
+    funderAddress: string;
+  };
+  contracts: {
+    exchange: string;
+    ctf: string;
+    usdc: string;
+    negRiskAdapter: string;
+    negRiskExchange: string;
+  };
+  trading: {
+    positionSizeMultiplier: number;
+    maxTradeSize: number;
+    minTradeSize: number;
+    slippageTolerance: number;
+    orderType: 'LIMIT' | 'FOK' | 'FAK';
+    copySells: boolean;
+  };
+  risk: {
+    maxSessionNotional: number;
+    maxPerMarketNotional: number;
+  };
+  run: {
+    exitAfterFirstSellCopy: boolean;
+  };
+  monitoring: {
+    pollInterval: number;
+    useWebSocket: boolean;
+    useUserChannel: boolean;
+    wsAssetIds: string[];
+    wsMarketIds: string[];
+  };
 }
 
-const useWebSocket = process.env.USE_WEBSOCKET !== 'false';
+function parseCsv(value?: string): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
 
-export const config = {
-  targetWallet: process.env.TARGET_WALLET || '',
-  privateKey: process.env.PRIVATE_KEY || '',
-  polymarketGeoToken: process.env.POLYMARKET_GEO_TOKEN || '',
-  rpcUrl: process.env.RPC_URL || 'https://polygon-rpc.com',
-  chainId: 137,
-
-  // Polygon mainnet contracts used for approvals and balance checks.
-  contracts: {
-    exchange: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
-    ctf: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
-    usdc: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
-    negRiskAdapter: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
-    negRiskExchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
-  },
-
-  trading: {
-    positionSizeMultiplier: parseFloat(process.env.POSITION_MULTIPLIER || '0.1'),
-    maxTradeSize: parseFloat(process.env.MAX_TRADE_SIZE || '100'),
-    minTradeSize: parseFloat(process.env.MIN_TRADE_SIZE || '1'),
-    slippageTolerance: parseFloat(process.env.SLIPPAGE_TOLERANCE || '0.02'),
-    // LIMIT=GTC, FOK=fill-or-kill, FAK=fill-and-kill
-    orderType: (process.env.ORDER_TYPE || 'FOK') as 'LIMIT' | 'FOK' | 'FAK',
-    // Copy SELL trades in addition to BUY (requires holding position from copied BUYs)
-    copySells: process.env.COPY_SELLS !== 'false',
-  },
-
-  risk: {
-    maxSessionNotional: parseFloat(process.env.MAX_SESSION_NOTIONAL || '0'),
-    maxPerMarketNotional: parseFloat(process.env.MAX_PER_MARKET_NOTIONAL || '0'),
-  },
-
-  run: {
-    exitAfterFirstSellCopy: process.env.EXIT_AFTER_FIRST_SELL_COPY === 'true',
-  },
-
-  monitoring: {
-    pollInterval: parseInt(process.env.POLL_INTERVAL || '2000'),
-    useWebSocket,
-    useUserChannel: process.env.USE_USER_CHANNEL === 'true',
-    wsAssetIds: parseCsv(process.env.WS_ASSET_IDS),
-    wsMarketIds: parseCsv(process.env.WS_MARKET_IDS),
+function parseFloatOrDefault(value: string | undefined, fallback: string): number {
+  const parsed = Number.parseFloat(value ?? fallback);
+  if (Number.isNaN(parsed)) {
+    return Number.parseFloat(fallback);
   }
-};
+  return parsed;
+}
 
-export function validateConfig(): void {
-  const required = ['targetWallet', 'privateKey'];
-  for (const key of required) {
-    if (!config[key as keyof typeof config]) {
-      throw new Error(`Missing required config: ${key}`);
+function parseIntOrDefault(value: string | undefined, fallback: string): number {
+  const parsed = Number.parseInt(value ?? fallback, 10);
+  if (Number.isNaN(parsed)) {
+    return Number.parseInt(fallback, 10);
+  }
+  return parsed;
+}
+
+function parseAuthMode(value?: string): AuthMode {
+  const normalized = value?.trim().toUpperCase();
+  if (!normalized) {
+    return 'EOA';
+  }
+  if (normalized === 'EOA' || normalized === 'PROXY') {
+    return normalized;
+  }
+  throw new Error(`Invalid AUTH_MODE: ${value}. Expected EOA or PROXY.`);
+}
+
+function parseSignatureType(value?: string): SignatureType | undefined {
+  if (!value || value.trim() === '') {
+    return undefined;
+  }
+
+  if (value === '0' || value === '1' || value === '2') {
+    return Number.parseInt(value, 10) as SignatureType;
+  }
+
+  throw new Error(`Invalid SIGNATURE_TYPE: ${value}. Expected 0, 1, or 2.`);
+}
+
+function resolveSignerPrivateKey(env: NodeJS.ProcessEnv): string {
+  return (
+    env.SIGNER_PRIVATE_KEY ||
+    env.EXECUTION_WALLET_PRIVATE_KEY ||
+    env.PRIVATE_KEY ||
+    ''
+  ).trim();
+}
+
+export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const authMode = parseAuthMode(env.AUTH_MODE);
+  const signatureType = parseSignatureType(env.SIGNATURE_TYPE);
+
+  return {
+    targetWallet: (env.TARGET_WALLET || '').trim(),
+    signerPrivateKey: resolveSignerPrivateKey(env),
+    polymarketGeoToken: env.POLYMARKET_GEO_TOKEN || '',
+    rpcUrl: env.RPC_URL || 'https://polygon-rpc.com',
+    chainId: 137,
+    auth: {
+      mode: authMode,
+      signatureType,
+      funderAddress: (env.FUNDER_ADDRESS || '').trim(),
+    },
+    contracts: {
+      exchange: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+      ctf: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
+      usdc: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+      negRiskAdapter: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
+      negRiskExchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+    },
+    trading: {
+      positionSizeMultiplier: parseFloatOrDefault(env.POSITION_MULTIPLIER, '0.1'),
+      maxTradeSize: parseFloatOrDefault(env.MAX_TRADE_SIZE, '100'),
+      minTradeSize: parseFloatOrDefault(env.MIN_TRADE_SIZE, '1'),
+      slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),
+      orderType: (env.ORDER_TYPE || 'FOK') as 'LIMIT' | 'FOK' | 'FAK',
+      copySells: env.COPY_SELLS !== 'false',
+    },
+    risk: {
+      maxSessionNotional: parseFloatOrDefault(env.MAX_SESSION_NOTIONAL, '0'),
+      maxPerMarketNotional: parseFloatOrDefault(env.MAX_PER_MARKET_NOTIONAL, '0'),
+    },
+    run: {
+      exitAfterFirstSellCopy: env.EXIT_AFTER_FIRST_SELL_COPY === 'true',
+    },
+    monitoring: {
+      pollInterval: parseIntOrDefault(env.POLL_INTERVAL, '2000'),
+      useWebSocket: env.USE_WEBSOCKET !== 'false',
+      useUserChannel: env.USE_USER_CHANNEL === 'true',
+      wsAssetIds: parseCsv(env.WS_ASSET_IDS),
+      wsMarketIds: parseCsv(env.WS_MARKET_IDS),
+    },
+  };
+}
+
+export const config = createConfig();
+
+export function validateConfig(candidate: AppConfig = config): void {
+  if (!candidate.targetWallet) {
+    throw new Error('Missing required config: targetWallet');
+  }
+
+  if (!candidate.signerPrivateKey) {
+    throw new Error(
+      'Missing required signer private key. Set SIGNER_PRIVATE_KEY or PRIVATE_KEY.'
+    );
+  }
+
+  if (candidate.auth.mode === 'PROXY') {
+    if (!candidate.auth.funderAddress) {
+      throw new Error('Missing required config for PROXY mode: FUNDER_ADDRESS');
+    }
+
+    if (candidate.auth.signatureType === undefined) {
+      throw new Error(
+        'Missing required config for PROXY mode: SIGNATURE_TYPE (set 1 for POLY_PROXY or 2 for GNOSIS_SAFE).'
+      );
+    }
+
+    if (candidate.auth.signatureType === 0) {
+      throw new Error('PROXY mode requires SIGNATURE_TYPE to be 1 or 2.');
     }
   }
 
-  logger.info('ℹ️  API credentials will be derived/generated from PRIVATE_KEY at startup');
+  const signatureType = candidate.auth.signatureType ?? 0;
+  const funderLabel =
+    candidate.auth.mode === 'PROXY'
+      ? candidate.auth.funderAddress
+      : 'resolved from signer wallet';
 
-  logger.info('✅ Configuration validated');
-  logger.info(`   Auth: EOA (signature type 0)`);
+  logger.info('API credentials will be derived/generated from the configured signer at startup');
+  logger.info('Configuration validated');
+  logger.info(`   Auth mode: ${candidate.auth.mode}`);
+  logger.info(`   Signature type: ${signatureType}`);
+  logger.info(`   Funder setting: ${funderLabel}`);
 }

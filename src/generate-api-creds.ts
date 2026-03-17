@@ -2,29 +2,36 @@ import dotenv from 'dotenv';
 import { Wallet } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';
 import * as fs from 'fs';
+import { config } from './config.js';
+import { createExecutionContext } from './execution-context.js';
 import { logger } from './logger.js';
 
 dotenv.config();
 
 const HOST = 'https://clob.polymarket.com';
-const CHAIN_ID = 137;
 
 async function main(): Promise<void> {
-  const privateKey = process.env.PRIVATE_KEY;
-  if (!privateKey) {
-    throw new Error('Missing PRIVATE_KEY in .env');
+  if (!config.signerPrivateKey) {
+    throw new Error('Missing SIGNER_PRIVATE_KEY or PRIVATE_KEY in .env');
   }
 
-  const signer = new Wallet(privateKey);
+  const signer = new Wallet(config.signerPrivateKey);
+  const executionContext = createExecutionContext(config);
   const client = new ClobClient(
     HOST,
-    CHAIN_ID,
+    config.chainId,
     signer,
     undefined,
     undefined,
     undefined,
-    process.env.POLYMARKET_GEO_TOKEN || undefined
+    config.polymarketGeoToken || undefined
   );
+
+  logger.info('Generating user API credentials');
+  logger.info(`   Auth mode: ${executionContext.authMode}`);
+  logger.info(`   Signer address: ${executionContext.signerAddress}`);
+  logger.info(`   Funder address: ${executionContext.funderAddress}`);
+  logger.info(`   Signature type: ${executionContext.signatureType}`);
 
   let creds = await client.deriveApiKey().catch(() => null);
   if (!creds || (creds as any).error) {
@@ -41,16 +48,18 @@ async function main(): Promise<void> {
 
   const outputFile = '.polymarket-api-creds';
   const fileContents =
-    'POLYMARKET_USER_API_KEY=' + apiKey + '\n' +
-    'POLYMARKET_USER_SECRET=' + secret + '\n' +
-    'POLYMARKET_USER_PASSPHRASE=' + passphrase + '\n';
+    `POLYMARKET_USER_API_KEY=${apiKey}\n` +
+    `POLYMARKET_USER_SECRET=${secret}\n` +
+    `POLYMARKET_USER_PASSPHRASE=${passphrase}\n`;
 
   fs.writeFileSync(outputFile, fileContents, { mode: 0o600 });
 
-  logger.info(`✅ API credentials have been generated successfully and written to ${outputFile}. Handle them securely and do not log them in plaintext.`);
+  logger.info(
+    `API credentials were generated successfully and written to ${outputFile}. Handle them securely.`
+  );
 }
 
 main().catch((error) => {
-  logger.error('❌ Failed to generate API credentials:', error.message || error);
+  logger.error('Failed to generate API credentials:', error.message || error);
   process.exit(1);
 });
