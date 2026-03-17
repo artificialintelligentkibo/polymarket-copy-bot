@@ -176,6 +176,31 @@ Run tests:
 npm test
 ```
 
+## Авто-погашення та фіксація прибутку
+
+Бот підтримує фоновий цикл керування вже відкритими позиціями.
+
+Що він робить:
+
+- кожні `REDEEM_INTERVAL_MS` мс перевіряє всі open positions із локального `PositionTracker`
+- якщо market уже resolved, викликає `redeem`
+- якщо market ще не resolved і `best bid` вищий за `AUTO_SELL_THRESHOLD`, продає всю tracked position
+
+Як увімкнути:
+
+```bash
+AUTO_REDEEM=true
+AUTO_SELL_THRESHOLD=0.92
+REDEEM_INTERVAL_MS=30000
+```
+
+Нотатки:
+
+- background task стартує через `trader.startAutoRedeemAndSell()`
+- у поточній реалізації auto-redeem працює напряму on-chain через `redeemPositions`
+- для `PROXY` mode auto-sell продовжує працювати, але auto-redeem потребує прямого контролю над funder wallet, який реально тримає позиції
+- у логах ти побачиш повідомлення на кшталт `Auto-redeem executed +$X.XX` або `Auto-sold winning position at 0.94`
+
 ## Startup Logging
 
 At startup the bot prints:

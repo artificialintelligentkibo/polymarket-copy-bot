@@ -95,7 +95,7 @@ export interface CopyExecutionResult {
   tokenId: string;
 }
 
-export class TradeExecutor {
+export class Trader {
   private readonly provider: ethers.providers.JsonRpcProvider;
   private readonly signerWallet: ethers.Wallet;
   private readonly executionContext: ExecutionContext;
@@ -149,10 +149,11 @@ export class TradeExecutor {
     this.positions.setSettlementHandlers({
       isMarketResolved: this.marketClient.isMarketResolved.bind(this.marketClient),
       redeemPosition: this.marketClient.redeem.bind(this.marketClient),
+      getBestBidPrice: this.marketClient.getBestBidPrice.bind(this.marketClient),
     });
 
     if (config.trading.autoRedeem) {
-      this.startAutoRedeemAndSell();
+      this.start();
     }
   }
 
@@ -193,6 +194,10 @@ export class TradeExecutor {
   clearCache(): void {
     this.marketCache.clear();
     logger.info('Market cache cleared');
+  }
+
+  start(): void {
+    this.startAutoRedeemAndSell();
   }
 
   startAutoRedeemAndSell(): void {
@@ -497,11 +502,14 @@ export class TradeExecutor {
               await this.positions.redeemPosition(position.tokenId, redeemableShares);
             });
 
+            const estimatedRedeemUsd = Math.round(redeemableShares * 100) / 100;
+            logger.info(`Auto-redeem executed +$${estimatedRedeemUsd.toFixed(2)} (estimated)`);
+
             redeemedMarkets.add(position.market);
             continue;
           }
 
-          const bestBidPrice = await this.marketClient.getBestBidPrice(position.tokenId);
+          const bestBidPrice = await this.positions.getBestBidPrice(position.tokenId);
           if (bestBidPrice <= config.trading.autoSellThreshold) {
             continue;
           }
@@ -904,7 +912,8 @@ export class TradeExecutor {
       throw new Error(`Auto-sell order failed: ${errorMsg}`);
     }
 
-    logger.info(`Auto-sell order executed: ${response.orderID}`);
+    logger.info(`Auto-sold winning position at ${validatedPrice.toFixed(2)}`);
+    logger.info(`   Auto-sell order ID: ${response.orderID}`);
 
     this.positions.recordFill({
       trade: this.createSyntheticTrade(position, 'SELL', validatedPrice, notional),
@@ -1226,4 +1235,4 @@ export class TradeExecutor {
   }
 }
 
-export { TradeExecutor as Trader };
+export { Trader as TradeExecutor };

@@ -18,6 +18,7 @@ export interface PositionState {
 interface PositionSettlementHandlers {
   isMarketResolved?: (marketId: string) => Promise<boolean>;
   redeemPosition?: (tokenId: string, amount: number) => Promise<void>;
+  getBestBidPrice?: (tokenId: string) => Promise<number>;
 }
 
 const MIN_POSITION_SHARES = 0.0001;
@@ -239,6 +240,14 @@ export class PositionTracker {
       }
       throw error;
     }
+  }
+
+  async getBestBidPrice(tokenId: string): Promise<number> {
+    if (!this.settlementHandlers.getBestBidPrice) {
+      return 0;
+    }
+
+    return this.settlementHandlers.getBestBidPrice(tokenId);
   }
 
   getPositions(): PositionState[] {
