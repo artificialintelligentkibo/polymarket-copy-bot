@@ -185,8 +185,16 @@ What happens in this mode:
 - the bot still detects target wallet trades through REST/WebSocket
 - no live `createAndPostOrder` or `createAndPostMarketOrder` call is sent to Polymarket
 - every detected target trade is appended to `logs/trades_YYYY-MM-DD.jsonl`
-- each JSONL record includes the target trade metadata, crypto spot context from Binance 1m candles, and the current local unrealized PnL snapshot
+- each JSONL record now includes:
+- `action` (`BUY` / `SELL`)
+- `outcome` (`YES` / `NO` / `UNKNOWN`)
+- `net_position_yes` and `net_position_no` for the current `market_condition_id`
+- `mid_price_orderbook` from the best bid/ask midpoint when the CLOB orderbook is available
+- `realized_pnl_target` when the activity API exposes target-wallet PnL
+- `crypto_prices_at_time` from Binance 1m candles via CCXT
+- `simulated_pnl_if_closed_now` from the local tracked position snapshot
 - if no live signer key is configured, the bot falls back to an ephemeral local signer because simulation mode is read-only
+- every 10 seconds the bot prints a net-position snapshot for all active slots so you can see when the target is holding both YES and NO simultaneously
 
 Example:
 
@@ -205,6 +213,8 @@ Expected output:
 
 - console banner `SIMULATION MODE ACTIVE — no real trades`
 - append-only trade logs inside `logs/`
+- JSONL records with `outcome`, `net_position_yes`, `net_position_no`, `mid_price_orderbook`, and `realized_pnl_target`
+- a 10-second console heartbeat such as `[simulation net] active slots: ...`
 - no real on-chain or CLOB order submission
 
 ## Авто-погашення та фіксація прибутку

@@ -393,9 +393,12 @@ export class Trader {
   async logTargetTradeSimulation(trade: Trade): Promise<void> {
     try {
       const marketContext = await this.resolveSimulationMarketContext(trade);
-      const outcome = marketContext.side === 'UNKNOWN'
-        ? this.normalizeOutcome(trade.outcome)
-        : marketContext.side;
+      const resolvedOutcome = trade.normalizedOutcome
+        ? trade.normalizedOutcome
+        : marketContext.side === 'UNKNOWN'
+          ? this.normalizeOutcome(trade.outcome)
+          : marketContext.side;
+      const midPriceOrderbook = await this.getMidPriceOrderbook(trade.tokenId, trade.price);
 
       await logSimulatedTrade({
         timestamp_ms: trade.timestamp,
@@ -403,11 +406,16 @@ export class Trader {
         market_condition_id: marketContext.marketConditionId || trade.market,
         slot_start: marketContext.slotStart,
         action: trade.side,
-        side: outcome,
+        outcome: trade.outcome || 'UNKNOWN',
+        outcomeIndex: trade.outcomeIndex ?? null,
+        asset: trade.asset ?? trade.tokenId ?? null,
+        resolved_outcome: resolvedOutcome,
         token_price: trade.price,
         shares: this.calculateSharesFromNotional(trade.size, trade.price),
         usdc_amount: trade.size,
         target_tx_hash_or_id: trade.txHash,
+        mid_price_orderbook: midPriceOrderbook,
+        realized_pnl_target: trade.realizedPnlTarget || 0,
         simulated_pnl_if_closed_now: this.estimateUnrealizedPnl(trade.tokenId, trade.price),
         is_copy_from_target: true,
       });
@@ -1567,6 +1575,28 @@ export class Trader {
     return (markPrice - position.avgPrice) * position.shares;
   }
 
+  private async getMidPriceOrderbook(tokenId: string, fallbackPrice: number): Promise<number> {
+    try {
+      const orderbook = await this.clobClient.getOrderBook(tokenId);
+      const bestBid = Number(orderbook?.bids?.[0]?.price || 0);
+      const bestAsk = Number(orderbook?.asks?.[0]?.price || 0);
+
+      if (bestBid > 0 && bestAsk > 0) {
+        return (bestBid + bestAsk) / 2;
+      }
+      if (bestBid > 0) {
+        return bestBid;
+      }
+      if (bestAsk > 0) {
+        return bestAsk;
+      }
+    } catch {
+      return fallbackPrice;
+    }
+
+    return fallbackPrice;
+  }
+
   private async resolveSimulationMarketContext(trade: Trade): Promise<SimulationMarketContext> {
     const marketConditionId =
       trade.marketConditionId ||
@@ -1731,8 +1761,11 @@ export class Trader {
 
   private normalizeOutcome(outcome: string): TradeOutcome {
     const normalized = String(outcome || '').trim().toUpperCase();
-    if (normalized === 'YES' || normalized === 'NO') {
-      return normalized as TradeOutcome;
+    if (normalized === 'YES' || normalized === 'UP' || normalized === 'LONG' || normalized === 'TRUE') {
+      return 'YES';
+    }
+    if (normalized === 'NO' || normalized === 'DOWN' || normalized === 'SHORT' || normalized === 'FALSE') {
+      return 'NO';
     }
     return 'UNKNOWN';
   }
