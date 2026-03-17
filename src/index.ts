@@ -3,7 +3,7 @@ import { logger } from './logger.js';
 import { TradeMonitor, type Trade } from './monitor.js';
 import { PositionTracker } from './positions.js';
 import { RiskManager } from './risk-manager.js';
-import { TradeExecutor } from './trader.js';
+import { TradeExecutor, TradeSkipError } from './trader.js';
 import { WebSocketMonitor } from './websocket-monitor.js';
 
 class PolymarketCopyBot {
@@ -25,8 +25,8 @@ class PolymarketCopyBot {
 
   constructor() {
     this.monitor = new TradeMonitor();
-    this.executor = new TradeExecutor();
     this.positions = new PositionTracker();
+    this.executor = new TradeExecutor(this.positions);
     this.risk = new RiskManager(this.positions);
   }
 
@@ -145,17 +145,6 @@ class PolymarketCopyBot {
 
     const copyNotional = this.executor.calculateCopySize(trade.size);
 
-    if (trade.side === 'SELL') {
-      const copyShares = this.executor.calculateSharesForNotional(copyNotional, trade.price);
-      const position = this.positions.getPosition(trade.tokenId);
-      if (!position || position.shares < copyShares) {
-        logger.warn(
-          `Skipping SELL trade: insufficient position (have ${position?.shares?.toFixed(4) ?? 0}, need ${copyShares.toFixed(4)} shares)`
-        );
-        return;
-      }
-    }
-
     if (this.wsMonitor) {
       await this.wsMonitor.subscribeToMarket(trade.tokenId);
     }
@@ -188,6 +177,10 @@ class PolymarketCopyBot {
         process.exit(0);
       }
     } catch (error: any) {
+      if (error instanceof TradeSkipError) {
+        logger.warn(error.message);
+        return;
+      }
       this.stats.tradesFailed++;
       logger.error('Failed to copy trade');
       if (error?.message) {

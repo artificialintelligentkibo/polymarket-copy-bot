@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { ethers } from 'ethers';
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
+import { PolymarketClient } from './client.js';
 import { config } from './config.js';
 import {
   createExecutionContext,
@@ -10,11 +11,13 @@ import {
   getPositionCheckAddress,
   type ExecutionContext,
 } from './execution-context.js';
-import type { Trade } from './monitor.js';
 import { logger } from './logger.js';
+import type { Trade, TradeOutcome } from './monitor.js';
+import { PositionTracker, type PositionState } from './positions.js';
 
 const DATA_API_POSITIONS = 'https://data-api.polymarket.com/positions';
 const CLOB_HOST = 'https://clob.polymarket.com';
+const MIN_SELL_NOTIONAL_USD = 0.5;
 
 interface MarketMetadata {
   tickSize: number;
@@ -35,6 +38,17 @@ interface ApiCredentials {
   apiKey: string;
   secret: string;
   passphrase: string;
+}
+
+interface ExecutionSize {
+  copyNotional: number;
+  copyShares: number;
+  ownedShares?: number;
+}
+
+interface FallbackLimitOptions {
+  forcedPrice?: number;
+  allowEmptyBook?: boolean;
 }
 
 export function normalizeFeeRateBps(raw: unknown): number {
@@ -65,6 +79,13 @@ export function normalizeFeeRateBps(raw: unknown): number {
   return 0;
 }
 
+export class TradeSkipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TradeSkipError';
+  }
+}
+
 export interface CopyExecutionResult {
   orderId: string;
   copyNotional: number;
@@ -78,17 +99,23 @@ export class TradeExecutor {
   private readonly provider: ethers.providers.JsonRpcProvider;
   private readonly signerWallet: ethers.Wallet;
   private readonly executionContext: ExecutionContext;
+  private readonly positions: PositionTracker;
+  private readonly marketClient: PolymarketClient;
   private clobClient: ClobClient;
   private apiCreds?: ApiCredentials;
   private marketCache: Map<string, MarketMetadata> = new Map();
   private readonly CACHE_TTL = 3600000;
   private readonly RETRY_CONFIG: RetryConfig = {
-    maxAttempts: 3,
+    maxAttempts: 5,
     initialDelay: 1000,
-    maxDelay: 10000,
+    maxDelay: 16000,
     backoffMultiplier: 2,
   };
   private approvalsChecked = false;
+  private initialized = false;
+  private autoRedeemTimer?: ReturnType<typeof setInterval>;
+  private autoRedeemCycleRunning = false;
+  private readonly unsupportedRedeemMarkets = new Set<string>();
   private readonly ERC20_ABI = [
     'function balanceOf(address) view returns (uint256)',
     'function allowance(address owner, address spender) view returns (uint256)',
@@ -104,11 +131,29 @@ export class TradeExecutor {
   );
   private readonly MIN_MAX_FEE_GWEI = Number.parseFloat(process.env.MIN_MAX_FEE_GWEI || '60');
 
-  constructor() {
+  constructor(positions: PositionTracker) {
+    this.positions = positions;
     this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
     this.signerWallet = new ethers.Wallet(config.signerPrivateKey, this.provider);
     this.executionContext = createExecutionContext(config);
     this.clobClient = this.createUnauthenticatedClient();
+    this.marketClient = new PolymarketClient({
+      provider: this.provider,
+      signerWallet: this.signerWallet,
+      executionContext: this.executionContext,
+      getClobClient: () => this.clobClient,
+      getTrackedMarketId: (tokenId) => this.positions.getPosition(tokenId)?.market,
+      getGasOverrides: this.getGasOverrides.bind(this),
+    });
+
+    this.positions.setSettlementHandlers({
+      isMarketResolved: this.marketClient.isMarketResolved.bind(this.marketClient),
+      redeemPosition: this.marketClient.redeem.bind(this.marketClient),
+    });
+
+    if (config.trading.autoRedeem) {
+      this.startAutoRedeemAndSell();
+    }
   }
 
   async initialize(): Promise<void> {
@@ -124,6 +169,7 @@ export class TradeExecutor {
     }
 
     await this.ensureApprovals();
+    this.initialized = true;
 
     logger.info('Trader initialized');
     logger.info(`   Market cache: Enabled (TTL: ${this.CACHE_TTL / 1000}s)`);
@@ -147,6 +193,22 @@ export class TradeExecutor {
   clearCache(): void {
     this.marketCache.clear();
     logger.info('Market cache cleared');
+  }
+
+  startAutoRedeemAndSell(): void {
+    if (this.autoRedeemTimer) {
+      return;
+    }
+
+    logger.info(
+      `Starting auto redeem/sell background task (${config.trading.redeemIntervalMs}ms interval, sell threshold ${config.trading.autoSellThreshold})`
+    );
+
+    this.autoRedeemTimer = setInterval(() => {
+      void this.runAutoRedeemAndSellCycle();
+    }, config.trading.redeemIntervalMs);
+
+    this.autoRedeemTimer.unref?.();
   }
 
   calculateCopySize(originalSize: number): number {
@@ -243,6 +305,7 @@ export class TradeExecutor {
   ): Promise<CopyExecutionResult> {
     const orderType = config.trading.orderType;
     const copyNotional = copyNotionalOverride ?? this.calculateCopySize(originalTrade.size);
+    const trackedPosition = this.positions.getPosition(originalTrade.tokenId);
 
     logger.info(`Executing copy trade (${orderType}):`);
     logger.info(`   Market: ${originalTrade.market}`);
@@ -250,11 +313,21 @@ export class TradeExecutor {
     logger.info(`   Original size: ${originalTrade.size} USDC`);
     logger.info(`   Token ID: ${originalTrade.tokenId}`);
     logger.info(`   Copy notional: ${copyNotional} USDC`);
+    this.logTrackedPosition(trackedPosition);
 
     return this.executeWithRetry(async () => {
       if (orderType === 'FOK' || orderType === 'FAK') {
-        return this.executeMarketOrder(originalTrade, orderType, copyNotional);
+        try {
+          return await this.executeMarketOrder(originalTrade, orderType, copyNotional);
+        } catch (error: any) {
+          if (this.shouldUseFallbackOrder(error, orderType, originalTrade.side)) {
+            logger.warn('   FOK BUY has no asks available, falling back to GTC limit order');
+            return this.executeFallbackLimitBuyOrder(originalTrade, copyNotional);
+          }
+          throw error;
+        }
       }
+
       return this.executeLimitOrder(originalTrade, copyNotional);
     });
   }
@@ -308,6 +381,26 @@ export class TradeExecutor {
     logger.info(`   Balance check address: ${getBalanceCheckAddress(this.executionContext)}`);
     logger.info(`   Allowance check address: ${getAllowanceCheckAddress(this.executionContext)}`);
     logger.info(`   Position check address: ${getPositionCheckAddress(this.executionContext)}`);
+    logger.info(`   Auto redeem: ${config.trading.autoRedeem ? 'enabled' : 'disabled'}`);
+    logger.info(`   Auto sell threshold: ${config.trading.autoSellThreshold}`);
+    logger.info(`   Redeem interval: ${config.trading.redeemIntervalMs}ms`);
+  }
+
+  private logTrackedPosition(position?: PositionState): void {
+    if (!position) {
+      logger.info('   Local tracked position: none');
+      return;
+    }
+
+    logger.info(
+      `   Local tracked position: ${position.shares.toFixed(4)} shares, ${position.notional.toFixed(2)} USDC`
+    );
+    if (position.resolved) {
+      logger.info('   Local tracked position is marked resolved');
+    }
+    if (position.redeemPending) {
+      logger.info('   Local tracked position is pending redeem');
+    }
   }
 
   private isApiError(resp: any): boolean {
@@ -358,11 +451,93 @@ export class TradeExecutor {
     );
   }
 
+  private async runAutoRedeemAndSellCycle(): Promise<void> {
+    if (!this.initialized || this.autoRedeemCycleRunning) {
+      return;
+    }
+
+    const openPositions = this.positions.getOpenPositions();
+    if (openPositions.length === 0) {
+      return;
+    }
+
+    this.autoRedeemCycleRunning = true;
+
+    try {
+      const redeemedMarkets = new Set<string>();
+
+      for (const position of openPositions) {
+        if (redeemedMarkets.has(position.market)) {
+          continue;
+        }
+
+        try {
+          const resolved = await this.positions.isMarketResolved(position.market);
+          if (resolved) {
+            if (!this.marketClient.canDirectlyRedeem()) {
+              if (!this.unsupportedRedeemMarkets.has(position.market)) {
+                this.unsupportedRedeemMarkets.add(position.market);
+                logger.warn(
+                  `Auto redeem skipped for market ${position.market}: funder ${this.executionContext.funderAddress} must submit redeemPositions directly`
+                );
+              }
+              continue;
+            }
+
+            const redeemableShares = this.positions.getWinningShares(position.tokenId);
+            if (redeemableShares <= 0) {
+              continue;
+            }
+
+            logger.info(
+              `Auto redeem triggered for market ${position.market} (${redeemableShares.toFixed(4)} tracked shares)`
+            );
+
+            await this.executeWithRetry(async () => {
+              await this.positions.redeemPosition(position.tokenId, redeemableShares);
+            });
+
+            redeemedMarkets.add(position.market);
+            continue;
+          }
+
+          const bestBidPrice = await this.marketClient.getBestBidPrice(position.tokenId);
+          if (bestBidPrice <= config.trading.autoSellThreshold) {
+            continue;
+          }
+
+          logger.info(
+            `Auto sell triggered for ${position.tokenId}: best bid ${bestBidPrice.toFixed(4)} > ${config.trading.autoSellThreshold}`
+          );
+
+          await this.executeWithRetry(async () => {
+            await this.executeManagedPositionSell(position);
+          });
+        } catch (error: any) {
+          if (error instanceof TradeSkipError) {
+            logger.warn(error.message);
+            continue;
+          }
+
+          logger.warn(
+            `Auto redeem/sell failed for ${position.tokenId}: ${error?.message || 'Unknown error'}`
+          );
+        }
+      }
+    } finally {
+      this.autoRedeemCycleRunning = false;
+    }
+  }
+
   private getBestPrice(orderbook: any, side: 'BUY' | 'SELL', fallback: number): number {
     if (side === 'BUY') {
       return Number(orderbook.asks[0]?.price || fallback);
     }
     return Number(orderbook.bids[0]?.price || fallback);
+  }
+
+  private getOrderbookLevels(orderbook: any, side: 'BUY' | 'SELL'): any[] {
+    return side === 'BUY' ? orderbook.asks || [] : orderbook.bids || [];
   }
 
   private applySlippage(price: number, side: 'BUY' | 'SELL', slippage: number): number {
@@ -373,11 +548,32 @@ export class TradeExecutor {
   }
 
   private ensureLiquidity(orderbook: any, side: 'BUY' | 'SELL'): void {
-    if (side === 'BUY' && orderbook.asks.length === 0) {
+    const levels = this.getOrderbookLevels(orderbook, side);
+    if (side === 'BUY' && levels.length === 0) {
       throw new Error('No asks available in orderbook');
     }
-    if (side === 'SELL' && orderbook.bids.length === 0) {
+    if (side === 'SELL' && levels.length === 0) {
       throw new Error('No bids available in orderbook');
+    }
+  }
+
+  private ensureLiquidityDepth(
+    orderbook: any,
+    side: 'BUY' | 'SELL',
+    requiredNotional: number
+  ): void {
+    const levels = this.getOrderbookLevels(orderbook, side);
+    const availableDepth = levels.reduce((total: number, level: any) => {
+      const price = Number(level?.price || 0);
+      const size = Number(level?.size || 0);
+      return total + price * size;
+    }, 0);
+
+    const minDepth = requiredNotional * 2;
+    if (availableDepth < minDepth) {
+      throw new TradeSkipError(
+        `skipped trade: insufficient liquidity depth (${availableDepth.toFixed(2)} < ${minDepth.toFixed(2)})`
+      );
     }
   }
 
@@ -385,6 +581,10 @@ export class TradeExecutor {
     try {
       return await fn();
     } catch (error: any) {
+      if (error instanceof TradeSkipError) {
+        throw error;
+      }
+
       const isRetryable = this.isRetryableError(error);
 
       if (!isRetryable || attempt >= this.RETRY_CONFIG.maxAttempts) {
@@ -412,6 +612,10 @@ export class TradeExecutor {
   }
 
   private isRetryableError(error: any): boolean {
+    if (error instanceof TradeSkipError) {
+      return false;
+    }
+
     const errorMsg = error?.message?.toLowerCase() || '';
     const responseData = error?.response?.data?.error?.toLowerCase() || '';
     const responseStatus = error?.response?.status;
@@ -427,6 +631,16 @@ export class TradeExecutor {
       responseData.includes('blocked')
     ) {
       logger.warn('   Access blocked (Cloudflare/geo restriction) - skipping trade');
+      return false;
+    }
+
+    if (
+      errorMsg.includes('no asks available in orderbook') ||
+      errorMsg.includes('no bids available in orderbook') ||
+      errorMsg.includes('not supported') ||
+      errorMsg.includes('not resolved yet') ||
+      errorMsg.includes('could not resolve condition')
+    ) {
       return false;
     }
 
@@ -467,35 +681,65 @@ export class TradeExecutor {
     return true;
   }
 
+  private shouldUseFallbackOrder(
+    error: unknown,
+    orderType: 'FOK' | 'FAK',
+    side: 'BUY' | 'SELL'
+  ): boolean {
+    if (orderType !== 'FOK' || side !== 'BUY') {
+      return false;
+    }
+
+    if (config.trading.orderTypeFallback !== 'GTC') {
+      return false;
+    }
+
+    const message = String((error as any)?.message || '').toLowerCase();
+    return message.includes('no asks available in orderbook');
+  }
   private async executeLimitOrder(
     originalTrade: Trade,
-    copyNotional: number
+    requestedNotional: number,
+    options: FallbackLimitOptions = {}
   ): Promise<CopyExecutionResult> {
-    await this.validateBalanceOrShares(originalTrade.side, copyNotional, originalTrade.tokenId);
-
     const [orderbook, marketMetadata] = await Promise.all([
       this.clobClient.getOrderBook(originalTrade.tokenId),
       this.getMarketMetadata(originalTrade.tokenId),
     ]);
     const orderOpts = this.getOrderOptionsFromMetadata(marketMetadata);
 
-    this.ensureLiquidity(orderbook, originalTrade.side);
+    if (!options.allowEmptyBook) {
+      this.ensureLiquidity(orderbook, originalTrade.side);
+    }
 
-    const { slippageTolerance } = config.trading;
-    const bestPrice = this.getBestPrice(orderbook, originalTrade.side, originalTrade.price);
-    const limitPrice = this.applySlippage(bestPrice, originalTrade.side, slippageTolerance);
-    const validatedPrice = await this.validatePrice(limitPrice, originalTrade.tokenId);
-    const copyShares = this.calculateSharesFromNotional(copyNotional, validatedPrice);
+    const executionPrice =
+      options.forcedPrice ??
+      this.applySlippage(
+        this.getBestPrice(orderbook, originalTrade.side, originalTrade.price),
+        originalTrade.side,
+        config.trading.slippageTolerance
+      );
+    const validatedPrice = await this.validatePrice(executionPrice, originalTrade.tokenId);
+    const executionSize = this.resolveExecutionSize(originalTrade, requestedNotional, validatedPrice);
+
+    if (originalTrade.side === 'BUY') {
+      await this.validateBalance(executionSize.copyNotional, originalTrade.tokenId);
+      if (!options.allowEmptyBook) {
+        this.ensureLiquidityDepth(orderbook, originalTrade.side, executionSize.copyNotional);
+      }
+    } else {
+      this.ensureLiquidityDepth(orderbook, originalTrade.side, executionSize.copyNotional);
+    }
 
     logger.info(`   Limit price: ${validatedPrice.toFixed(4)}`);
-    logger.info(`   Copy shares: ${copyShares}`);
+    logger.info(`   Copy shares: ${executionSize.copyShares}`);
     logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
     const response = await this.clobClient.createAndPostOrder(
       {
         tokenID: originalTrade.tokenId,
         price: validatedPrice,
-        size: copyShares,
+        size: executionSize.copyShares,
         side: originalTrade.side as Side,
         feeRateBps: marketMetadata.feeRateBps,
       },
@@ -512,21 +756,38 @@ export class TradeExecutor {
     logger.info(`Limit order placed: ${response.orderID}`);
     return {
       orderId: response.orderID,
-      copyNotional,
-      copyShares,
+      copyNotional: executionSize.copyNotional,
+      copyShares: executionSize.copyShares,
       price: validatedPrice,
       side: originalTrade.side,
       tokenId: originalTrade.tokenId,
     };
   }
 
+  private async executeFallbackLimitBuyOrder(
+    originalTrade: Trade,
+    requestedNotional: number
+  ): Promise<CopyExecutionResult> {
+    const orderbook = await this.clobClient.getOrderBook(originalTrade.tokenId);
+    const bestAsk = orderbook.asks?.[0]?.price
+      ? Number(orderbook.asks[0].price)
+      : originalTrade.price;
+    const fallbackPrice = Math.min(bestAsk + 0.01, 0.99);
+
+    logger.info(`   Fallback order type: ${config.trading.orderTypeFallback}`);
+    logger.info(`   Fallback price target: ${fallbackPrice.toFixed(4)}`);
+
+    return this.executeLimitOrder(originalTrade, requestedNotional, {
+      forcedPrice: fallbackPrice,
+      allowEmptyBook: true,
+    });
+  }
+
   private async executeMarketOrder(
     originalTrade: Trade,
     orderType: 'FOK' | 'FAK',
-    copyNotional: number
+    requestedNotional: number
   ): Promise<CopyExecutionResult> {
-    await this.validateBalanceOrShares(originalTrade.side, copyNotional, originalTrade.tokenId);
-
     const [orderbook, marketMetadata] = await Promise.all([
       this.clobClient.getOrderBook(originalTrade.tokenId),
       this.getMarketMetadata(originalTrade.tokenId),
@@ -535,21 +796,29 @@ export class TradeExecutor {
 
     this.ensureLiquidity(orderbook, originalTrade.side);
 
-    const { slippageTolerance } = config.trading;
-    const bestPrice = this.getBestPrice(orderbook, originalTrade.side, originalTrade.price);
-    const marketPrice = this.applySlippage(bestPrice, originalTrade.side, slippageTolerance);
+    const marketPrice = this.applySlippage(
+      this.getBestPrice(orderbook, originalTrade.side, originalTrade.price),
+      originalTrade.side,
+      config.trading.slippageTolerance
+    );
     const validatedPrice = await this.validatePrice(marketPrice, originalTrade.tokenId);
-    const copyShares = this.calculateSharesFromNotional(copyNotional, validatedPrice);
+    const executionSize = this.resolveExecutionSize(originalTrade, requestedNotional, validatedPrice);
+
+    if (originalTrade.side === 'BUY') {
+      await this.validateBalance(executionSize.copyNotional, originalTrade.tokenId);
+    }
+
+    this.ensureLiquidityDepth(orderbook, originalTrade.side, executionSize.copyNotional);
 
     logger.info(`   Market price: ${validatedPrice.toFixed(4)}`);
-    logger.info(`   Copy shares: ${copyShares}`);
+    logger.info(`   Copy shares: ${executionSize.copyShares}`);
     logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
     const orderTypeEnum = orderType === 'FOK' ? OrderType.FOK : OrderType.FAK;
     const response = await this.clobClient.createAndPostMarketOrder(
       {
         tokenID: originalTrade.tokenId,
-        amount: originalTrade.side === 'BUY' ? copyNotional : copyShares,
+        amount: originalTrade.side === 'BUY' ? executionSize.copyNotional : executionSize.copyShares,
         price: validatedPrice,
         side: originalTrade.side as Side,
         feeRateBps: marketMetadata.feeRateBps,
@@ -572,76 +841,107 @@ export class TradeExecutor {
 
     return {
       orderId: response.orderID,
-      copyNotional,
-      copyShares,
+      copyNotional: executionSize.copyNotional,
+      copyShares: executionSize.copyShares,
       price: validatedPrice,
       side: originalTrade.side,
       tokenId: originalTrade.tokenId,
     };
   }
 
-  private async validateBalanceOrShares(
-    side: 'BUY' | 'SELL',
-    copyNotional: number,
-    tokenId: string
-  ): Promise<void> {
-    if (side === 'SELL') {
-      await this.validateSharesForSell(copyNotional, tokenId);
-      return;
+  private async executeManagedPositionSell(position: PositionState): Promise<void> {
+    const availableShares = this.positions.getWinningShares(position.tokenId);
+    if (availableShares <= 0) {
+      throw new TradeSkipError(`Auto-sell skipped for ${position.tokenId}: no remaining shares`);
     }
 
-    await this.validateBalance(copyNotional, tokenId);
-  }
+    const [orderbook, marketMetadata] = await Promise.all([
+      this.clobClient.getOrderBook(position.tokenId),
+      this.getMarketMetadata(position.tokenId),
+    ]);
+    const orderOpts = this.getOrderOptionsFromMetadata(marketMetadata);
 
-  private async validateSharesForSell(copyNotional: number, tokenId: string): Promise<void> {
-    const orderbook = await this.clobClient.getOrderBook(tokenId);
-    const bestBid = orderbook.bids[0]?.price;
-    const price = bestBid ? Number.parseFloat(bestBid) : 0.5;
-    const copyShares = this.calculateSharesFromNotional(copyNotional, price);
+    this.ensureLiquidity(orderbook, 'SELL');
 
-    const positions = await this.fetchPositionsFromDataApi();
-    const pos = this.findPositionByTokenId(positions, tokenId);
-    const availableShares = this.getPositionShares(pos);
-    const checkedAddress = getPositionCheckAddress(this.executionContext);
-
-    if (availableShares < copyShares) {
-      throw new Error(
-        `insufficient shares to sell for ${checkedAddress} (have ${availableShares.toFixed(4)}, need ${copyShares.toFixed(4)})`
+    const bestBidPrice = Number(orderbook?.bids?.[0]?.price || 0);
+    if (bestBidPrice <= config.trading.autoSellThreshold) {
+      throw new TradeSkipError(
+        `Auto-sell skipped for ${position.tokenId}: best bid ${bestBidPrice.toFixed(4)} <= ${config.trading.autoSellThreshold}`
       );
     }
 
+    const validatedPrice = await this.validatePrice(bestBidPrice, position.tokenId);
+    const notional = Math.round(availableShares * validatedPrice * 100) / 100;
+
+    if (notional < MIN_SELL_NOTIONAL_USD) {
+      throw new TradeSkipError(
+        `Auto-sell skipped for ${position.tokenId}: position notional ${notional.toFixed(2)} < ${MIN_SELL_NOTIONAL_USD}`
+      );
+    }
+
+    this.ensureLiquidityDepth(orderbook, 'SELL', notional);
+
     logger.info(
-      `   Position check passed for ${checkedAddress} (${availableShares.toFixed(4)} >= ${copyShares.toFixed(4)} shares)`
+      `   Auto-selling ${availableShares.toFixed(4)} shares of ${position.tokenId} at best bid ${validatedPrice.toFixed(4)}`
     );
-  }
+    logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
-  private getPositionTokenId(position: any): string | undefined {
-    if (!position) return undefined;
-
-    const id =
-      position.asset_id ??
-      position.token_id ??
-      position.tokenId ??
-      position.assetId ??
-      (typeof position.asset === 'string' ? position.asset : position.asset?.token_id);
-
-    return id ? String(id).trim() : undefined;
-  }
-
-  private getPositionShares(position: any): number {
-    if (!position) return 0;
-    const raw = position.size ?? position.quantity ?? position.shares ?? position.balance ?? position.position;
-    const parsed = typeof raw === 'string' ? Number.parseFloat(raw) : Number(raw);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-
-  private findPositionByTokenId(positions: any[], tokenId: string): any {
-    const target = tokenId.toLowerCase();
-    return (positions || []).find(
-      (position) => this.getPositionTokenId(position)?.toLowerCase() === target
+    const response = await this.clobClient.createAndPostMarketOrder(
+      {
+        tokenID: position.tokenId,
+        amount: availableShares,
+        price: validatedPrice,
+        side: Side.SELL,
+        feeRateBps: marketMetadata.feeRateBps,
+        orderType: OrderType.FOK,
+      },
+      orderOpts,
+      OrderType.FOK
     );
+
+    if (!response.success) {
+      const errorMsg = response.errorMsg || response.error || 'Unknown error';
+      throw new Error(`Auto-sell order failed: ${errorMsg}`);
+    }
+
+    logger.info(`Auto-sell order executed: ${response.orderID}`);
+
+    this.positions.recordFill({
+      trade: this.createSyntheticTrade(position, 'SELL', validatedPrice, notional),
+      notional,
+      shares: availableShares,
+      price: validatedPrice,
+      side: 'SELL',
+    });
   }
 
+  private resolveExecutionSize(
+    originalTrade: Trade,
+    requestedNotional: number,
+    executionPrice: number
+  ): ExecutionSize {
+    if (originalTrade.side === 'BUY') {
+      return {
+        copyNotional: requestedNotional,
+        copyShares: this.calculateSharesFromNotional(requestedNotional, executionPrice),
+      };
+    }
+
+    const ownedShares = this.positions.getSellableShares(originalTrade.tokenId);
+    const targetShares = this.calculateSharesFromNotional(requestedNotional, executionPrice);
+    const sellShares = Math.min(targetShares, ownedShares || 0);
+    const sellNotional = Math.round(sellShares * executionPrice * 100) / 100;
+
+    if (sellNotional < MIN_SELL_NOTIONAL_USD || sellShares <= 0) {
+      throw new TradeSkipError('skipped sell: insufficient shares');
+    }
+
+    return {
+      copyNotional: sellNotional,
+      copyShares: sellShares,
+      ownedShares,
+    };
+  }
   private async fetchPositionsFromDataApi(): Promise<any[]> {
     const checkedAddress = getPositionCheckAddress(this.executionContext);
 
@@ -750,7 +1050,6 @@ export class TradeExecutor {
       negRisk: metadata.negRisk,
     };
   }
-
   private async ensureApprovals(): Promise<void> {
     if (this.approvalsChecked) {
       return;
@@ -896,7 +1195,35 @@ export class TradeExecutor {
     };
   }
 
+  private createSyntheticTrade(
+    position: PositionState,
+    side: 'BUY' | 'SELL',
+    price: number,
+    size: number
+  ): Trade {
+    return {
+      txHash: `managed-${side.toLowerCase()}-${position.tokenId}-${Date.now()}`,
+      timestamp: Date.now(),
+      market: position.market,
+      tokenId: position.tokenId,
+      side,
+      price,
+      size,
+      outcome: this.normalizeOutcome(position.outcome),
+    };
+  }
+
+  private normalizeOutcome(outcome: string): TradeOutcome {
+    const normalized = String(outcome || '').trim().toUpperCase();
+    if (normalized === 'YES' || normalized === 'NO') {
+      return normalized as TradeOutcome;
+    }
+    return 'UNKNOWN';
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+
+export { TradeExecutor as Trader };

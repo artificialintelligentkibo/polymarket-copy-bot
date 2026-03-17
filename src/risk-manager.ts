@@ -1,5 +1,5 @@
-import type { Trade } from './monitor.js';
 import { config } from './config.js';
+import type { Trade } from './monitor.js';
 import { PositionTracker } from './positions.js';
 
 export interface RiskCheckResult {
@@ -9,7 +9,8 @@ export interface RiskCheckResult {
 
 export class RiskManager {
   private sessionNotional = 0;
-  private positions: PositionTracker;
+  private readonly positions: PositionTracker;
+  private readonly minCopySizeUsd = 0.5;
 
   constructor(positions: PositionTracker) {
     this.positions = positions;
@@ -18,6 +19,13 @@ export class RiskManager {
   checkTrade(trade: Trade, copyNotional: number): RiskCheckResult {
     if (copyNotional <= 0) {
       return { allowed: false, reason: 'Copy notional is <= 0' };
+    }
+
+    if (copyNotional < this.minCopySizeUsd) {
+      return {
+        allowed: false,
+        reason: `Copy notional is below minimum (${copyNotional.toFixed(2)} < ${this.minCopySizeUsd.toFixed(2)})`,
+      };
     }
 
     if (config.risk.maxSessionNotional > 0) {

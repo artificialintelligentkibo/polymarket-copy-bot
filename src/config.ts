@@ -30,7 +30,11 @@ export interface AppConfig {
     minTradeSize: number;
     slippageTolerance: number;
     orderType: 'LIMIT' | 'FOK' | 'FAK';
+    orderTypeFallback: 'GTC' | 'NONE';
     copySells: boolean;
+    autoRedeem: boolean;
+    autoSellThreshold: number;
+    redeemIntervalMs: number;
   };
   risk: {
     maxSessionNotional: number;
@@ -132,7 +136,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       minTradeSize: parseFloatOrDefault(env.MIN_TRADE_SIZE, '1'),
       slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),
       orderType: (env.ORDER_TYPE || 'FOK') as 'LIMIT' | 'FOK' | 'FAK',
+      orderTypeFallback: (env.ORDER_TYPE_FALLBACK || 'GTC') as 'GTC' | 'NONE',
       copySells: env.COPY_SELLS !== 'false',
+      autoRedeem: env.AUTO_REDEEM === 'true',
+      autoSellThreshold: parseFloatOrDefault(env.AUTO_SELL_THRESHOLD, '0.92'),
+      redeemIntervalMs: parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000'),
     },
     risk: {
       maxSessionNotional: parseFloatOrDefault(env.MAX_SESSION_NOTIONAL, '0'),
@@ -186,9 +194,33 @@ export function validateConfig(candidate: AppConfig = config): void {
       ? candidate.auth.funderAddress
       : 'resolved from signer wallet';
 
+  if (
+    candidate.trading.autoSellThreshold <= 0 ||
+    candidate.trading.autoSellThreshold >= 1
+  ) {
+    throw new Error(
+      `AUTO_SELL_THRESHOLD must be between 0 and 1 (exclusive). Received ${candidate.trading.autoSellThreshold}.`
+    );
+  }
+
+  if (candidate.trading.redeemIntervalMs < 1000) {
+    throw new Error(
+      `REDEEM_INTERVAL_MS must be at least 1000ms. Received ${candidate.trading.redeemIntervalMs}.`
+    );
+  }
+
   logger.info('API credentials will be derived/generated from the configured signer at startup');
   logger.info('Configuration validated');
   logger.info(`   Auth mode: ${candidate.auth.mode}`);
   logger.info(`   Signature type: ${signatureType}`);
   logger.info(`   Funder setting: ${funderLabel}`);
+  logger.info(`   Auto redeem enabled: ${candidate.trading.autoRedeem ? 'yes' : 'no'}`);
+  logger.info(`   Auto sell threshold: ${candidate.trading.autoSellThreshold}`);
+  logger.info(`   Redeem interval: ${candidate.trading.redeemIntervalMs}ms`);
+
+  if (candidate.trading.autoRedeem && candidate.auth.mode === 'PROXY') {
+    logger.warn(
+      'AUTO_REDEEM is enabled in PROXY mode. Auto-sell still works, but on-chain redeem requires the token-holding wallet to submit the transaction directly.'
+    );
+  }
 }

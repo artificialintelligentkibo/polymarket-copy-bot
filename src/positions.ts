@@ -1,3 +1,4 @@
+import { logger } from './logger.js';
 import type { Trade } from './monitor.js';
 
 export interface PositionState {
@@ -8,12 +9,30 @@ export interface PositionState {
   notional: number;
   avgPrice: number;
   lastUpdated: number;
+  resolved: boolean;
+  redeemPending: boolean;
+  redeemedShares: number;
+  lastRedeemedAt?: number;
 }
+
+interface PositionSettlementHandlers {
+  isMarketResolved?: (marketId: string) => Promise<boolean>;
+  redeemPosition?: (tokenId: string, amount: number) => Promise<void>;
+}
+
+const MIN_POSITION_SHARES = 0.0001;
+const MIN_POSITION_NOTIONAL = 0.01;
 
 export class PositionTracker {
   private positions = new Map<string, PositionState>();
+  private settlementHandlers: PositionSettlementHandlers = {};
+
+  setSettlementHandlers(handlers: PositionSettlementHandlers): void {
+    this.settlementHandlers = handlers;
+  }
 
   loadFromClobPositions(positions: any[]): { loaded: number; skipped: number } {
+    const nextPositions = new Map<string, PositionState>();
     let loaded = 0;
     let skipped = 0;
 
@@ -30,21 +49,33 @@ export class PositionTracker {
         continue;
       }
 
+      const existing = this.positions.get(tokenId);
       const market =
         pos?.condition_id ||
         pos?.conditionId ||
         pos?.market ||
         pos?.market_id ||
+        existing?.market ||
         '';
 
-      const outcome = pos?.outcome || pos?.side || 'YES';
+      const outcome = pos?.outcome || pos?.side || existing?.outcome || 'YES';
 
-      const shares = this.parseNumber(pos?.size ?? pos?.quantity ?? pos?.shares ?? pos?.balance ?? pos?.position);
-      const notional = this.parseNumber(pos?.usdcValue ?? pos?.notional ?? pos?.usdc ?? pos?.value ?? pos?.collateral);
+      const shares = this.parseNumber(
+        pos?.size ?? pos?.quantity ?? pos?.shares ?? pos?.balance ?? pos?.position
+      );
+      const notional = this.parseNumber(
+        pos?.usdcValue ?? pos?.notional ?? pos?.usdc ?? pos?.value ?? pos?.collateral
+      );
       const avgPrice =
         this.parseNumber(pos?.avgPrice ?? pos?.averagePrice ?? pos?.entryPrice ?? pos?.price) ||
         (shares > 0 ? Math.abs(notional / shares) : 0);
 
+      if (shares < MIN_POSITION_SHARES || notional < MIN_POSITION_NOTIONAL) {
+        skipped++;
+        continue;
+      }
+
+      const redeemedShares = Math.min(existing?.redeemedShares || 0, shares);
       const state: PositionState = {
         tokenId,
         market,
@@ -53,12 +84,17 @@ export class PositionTracker {
         notional: Math.max(0, notional),
         avgPrice,
         lastUpdated: Date.now(),
+        resolved: existing?.resolved || false,
+        redeemPending: false,
+        redeemedShares,
+        lastRedeemedAt: existing?.lastRedeemedAt,
       };
 
-      this.positions.set(tokenId, state);
+      nextPositions.set(tokenId, state);
       loaded++;
     }
 
+    this.positions = nextPositions;
     return { loaded, skipped };
   }
 
@@ -79,7 +115,11 @@ export class PositionTracker {
 
     const nextShares = (existing?.shares || 0) + deltaShares;
     const nextNotional = (existing?.notional || 0) + deltaNotional;
-    const avgPrice = nextShares !== 0 ? Math.abs(nextNotional / nextShares) : 0;
+
+    if (nextShares <= MIN_POSITION_SHARES || nextNotional <= MIN_POSITION_NOTIONAL) {
+      this.positions.delete(key);
+      return;
+    }
 
     const updated: PositionState = {
       tokenId: trade.tokenId,
@@ -87,19 +127,125 @@ export class PositionTracker {
       outcome: trade.outcome,
       shares: Math.max(0, nextShares),
       notional: Math.max(0, nextNotional),
-      avgPrice: nextShares !== 0 ? avgPrice : 0,
+      avgPrice: price > 0 ? price : existing?.avgPrice || 0,
       lastUpdated: Date.now(),
+      resolved: side === 'BUY' ? false : existing?.resolved || false,
+      redeemPending: false,
+      redeemedShares: side === 'BUY' ? 0 : Math.min(existing?.redeemedShares || 0, Math.max(0, nextShares)),
+      lastRedeemedAt: existing?.lastRedeemedAt,
     };
 
     this.positions.set(key, updated);
   }
 
   getPosition(tokenId: string): PositionState | undefined {
-    return this.positions.get(tokenId);
+    const position = this.positions.get(tokenId);
+    if (!position) {
+      return undefined;
+    }
+
+    return {
+      ...position,
+      redeemedShares: Math.min(position.redeemedShares, position.shares),
+    };
+  }
+
+  getSellableShares(tokenId: string): number {
+    return this.getWinningShares(tokenId);
+  }
+
+  getWinningShares(tokenId: string): number {
+    const position = this.positions.get(tokenId);
+    if (!position) {
+      return 0;
+    }
+
+    const remainingShares = position.shares - position.redeemedShares;
+    return Math.max(0, remainingShares);
+  }
+
+  getOpenPositions(): PositionState[] {
+    return Array.from(this.positions.values())
+      .map((position) => this.getPosition(position.tokenId))
+      .filter((position): position is PositionState => {
+        if (!position) {
+          return false;
+        }
+
+        return (
+          !position.redeemPending &&
+          this.getWinningShares(position.tokenId) > MIN_POSITION_SHARES
+        );
+      });
+  }
+
+  async isMarketResolved(marketId: string): Promise<boolean> {
+    if (!this.settlementHandlers.isMarketResolved) {
+      return false;
+    }
+
+    const resolved = await this.settlementHandlers.isMarketResolved(marketId);
+    if (resolved) {
+      for (const position of this.positions.values()) {
+        if (position.market === marketId) {
+          position.resolved = true;
+          position.lastUpdated = Date.now();
+        }
+      }
+    }
+
+    return resolved;
+  }
+
+  async redeemPosition(tokenId: string, amount: number): Promise<void> {
+    if (!this.settlementHandlers.redeemPosition) {
+      throw new Error('Redeem handler is not configured');
+    }
+
+    const position = this.positions.get(tokenId);
+    if (!position) {
+      return;
+    }
+
+    const relatedPositions = Array.from(this.positions.values()).filter(
+      (entry) => entry.market === position.market
+    );
+
+    for (const entry of relatedPositions) {
+      entry.redeemPending = true;
+      entry.resolved = true;
+      entry.lastUpdated = Date.now();
+    }
+
+    try {
+      await this.settlementHandlers.redeemPosition(tokenId, amount);
+      const redeemedAt = Date.now();
+
+      for (const entry of relatedPositions) {
+        entry.redeemedShares = entry.shares;
+        entry.redeemPending = false;
+        entry.lastRedeemedAt = redeemedAt;
+        entry.lastUpdated = redeemedAt;
+        this.positions.delete(entry.tokenId);
+      }
+
+      logger.info(
+        `Redeemed tracked position(s) for market ${position.market}; removed ${relatedPositions.length} cached position(s)`
+      );
+    } catch (error) {
+      for (const entry of relatedPositions) {
+        entry.redeemPending = false;
+        entry.lastUpdated = Date.now();
+      }
+      throw error;
+    }
   }
 
   getPositions(): PositionState[] {
-    return Array.from(this.positions.values());
+    return Array.from(this.positions.values()).map((position) => ({
+      ...position,
+      redeemedShares: Math.min(position.redeemedShares, position.shares),
+    }));
   }
 
   getNotional(tokenId: string): number {
