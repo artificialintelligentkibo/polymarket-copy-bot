@@ -29,7 +29,7 @@ export interface AppConfig {
     maxTradeSize: number;
     minTradeSize: number;
     slippageTolerance: number;
-    orderType: 'LIMIT' | 'FOK' | 'FAK';
+    orderType: 'LIMIT' | 'GTC' | 'FOK' | 'FAK';
     orderTypeFallback: 'GTC' | 'NONE';
     copySells: boolean;
     autoRedeem: boolean;
@@ -116,7 +116,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     targetWallet: (env.TARGET_WALLET || '').trim(),
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: env.POLYMARKET_GEO_TOKEN || '',
-    rpcUrl: env.RPC_URL || 'https://polygon-rpc.com',
+    rpcUrl: env.RPC_URL || 'https://polygon.drpc.org',
     chainId: 137,
     auth: {
       mode: authMode,
@@ -131,15 +131,15 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       negRiskExchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
     },
     trading: {
-      positionSizeMultiplier: parseFloatOrDefault(env.POSITION_MULTIPLIER, '0.1'),
-      maxTradeSize: parseFloatOrDefault(env.MAX_TRADE_SIZE, '100'),
-      minTradeSize: parseFloatOrDefault(env.MIN_TRADE_SIZE, '1'),
+      positionSizeMultiplier: parseFloatOrDefault(env.POSITION_MULTIPLIER, '0.05'),
+      maxTradeSize: parseFloatOrDefault(env.MAX_TRADE_SIZE, '5'),
+      minTradeSize: parseFloatOrDefault(env.MIN_TRADE_SIZE, '1.10'),
       slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),
-      orderType: (env.ORDER_TYPE || 'FOK') as 'LIMIT' | 'FOK' | 'FAK',
+      orderType: (env.ORDER_TYPE || 'GTC') as 'LIMIT' | 'GTC' | 'FOK' | 'FAK',
       orderTypeFallback: (env.ORDER_TYPE_FALLBACK || 'GTC') as 'GTC' | 'NONE',
-      copySells: env.COPY_SELLS !== 'false',
-      autoRedeem: env.AUTO_REDEEM === 'true',
-      autoSellThreshold: parseFloatOrDefault(env.AUTO_SELL_THRESHOLD, '0.92'),
+      copySells: env.COPY_SELLS === 'true',
+      autoRedeem: env.AUTO_REDEEM !== 'false',
+      autoSellThreshold: parseFloatOrDefault(env.AUTO_SELL_THRESHOLD, '0.88'),
       redeemIntervalMs: parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000'),
     },
     risk: {

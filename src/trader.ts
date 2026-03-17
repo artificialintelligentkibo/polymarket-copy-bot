@@ -18,6 +18,11 @@ import { PositionTracker, type PositionState } from './positions.js';
 const DATA_API_POSITIONS = 'https://data-api.polymarket.com/positions';
 const CLOB_HOST = 'https://clob.polymarket.com';
 const MIN_SELL_NOTIONAL_USD = 0.5;
+const AUTO_SELL_MIN_BID_PRICE = 0.85;
+const AUTO_SELL_MIN_SHARES = 1.5;
+const AUTO_SELL_GTC_OFFSET = 0.005;
+const AUTO_SELL_GTC_TIMEOUT_MS = 15000;
+const AUTO_SELL_HEARTBEAT_INTERVAL_MS = 5000;
 
 interface MarketMetadata {
   tickSize: number;
@@ -115,7 +120,6 @@ export class Trader {
   private initialized = false;
   private autoRedeemTimer?: ReturnType<typeof setInterval>;
   private autoRedeemCycleRunning = false;
-  private readonly unsupportedRedeemMarkets = new Set<string>();
   private readonly ERC20_ABI = [
     'function balanceOf(address) view returns (uint256)',
     'function allowance(address owner, address spender) view returns (uint256)',
@@ -210,7 +214,11 @@ export class Trader {
     );
 
     this.autoRedeemTimer = setInterval(() => {
-      void this.runAutoRedeemAndSellCycle();
+      const openPositions = this.positions.getOpenPositions();
+      console.log(
+        `[AUTO TICK ${new Date().toISOString()}] positions: ${openPositions.length} | checking sell threshold ${config.trading.autoSellThreshold}`
+      );
+      void this.runAutoRedeemAndSellCycle(openPositions);
     }, config.trading.redeemIntervalMs);
 
     this.autoRedeemTimer.unref?.();
@@ -456,12 +464,13 @@ export class Trader {
     );
   }
 
-  private async runAutoRedeemAndSellCycle(): Promise<void> {
+  private async runAutoRedeemAndSellCycle(
+    openPositions: PositionState[] = this.positions.getOpenPositions()
+  ): Promise<void> {
     if (!this.initialized || this.autoRedeemCycleRunning) {
       return;
     }
 
-    const openPositions = this.positions.getOpenPositions();
     if (openPositions.length === 0) {
       return;
     }
@@ -479,16 +488,6 @@ export class Trader {
         try {
           const resolved = await this.positions.isMarketResolved(position.market);
           if (resolved) {
-            if (!this.marketClient.canDirectlyRedeem()) {
-              if (!this.unsupportedRedeemMarkets.has(position.market)) {
-                this.unsupportedRedeemMarkets.add(position.market);
-                logger.warn(
-                  `Auto redeem skipped for market ${position.market}: funder ${this.executionContext.funderAddress} must submit redeemPositions directly`
-                );
-              }
-              continue;
-            }
-
             const redeemableShares = this.positions.getWinningShares(position.tokenId);
             if (redeemableShares <= 0) {
               continue;
@@ -498,28 +497,75 @@ export class Trader {
               `Auto redeem triggered for market ${position.market} (${redeemableShares.toFixed(4)} tracked shares)`
             );
 
-            await this.executeWithRetry(async () => {
-              await this.positions.redeemPosition(position.tokenId, redeemableShares);
-            });
+            try {
+              if (!this.marketClient.canDirectlyRedeem()) {
+                throw new Error(
+                  `proxy wallet requires manual Safe signature for redeem on funder ${this.executionContext.funderAddress}`
+                );
+              }
 
-            const estimatedRedeemUsd = Math.round(redeemableShares * 100) / 100;
-            logger.info(`Auto-redeem executed +$${estimatedRedeemUsd.toFixed(2)} (estimated)`);
+              await this.executeWithRetry(async () => {
+                await this.positions.redeemPosition(position.tokenId, redeemableShares);
+              });
+
+              const estimatedRedeemUsd = Math.round(redeemableShares * 100) / 100;
+              console.log(`✅ Auto-redeem SUCCESS +$${estimatedRedeemUsd.toFixed(2)}`);
+              logger.info(`Auto-redeem executed +$${estimatedRedeemUsd.toFixed(2)} (estimated)`);
+            } catch (error: any) {
+              const message = String(error?.message || error || '');
+              if (
+                message.includes('signature') ||
+                message.includes('Safe') ||
+                message.includes('proxy')
+              ) {
+                console.warn(
+                  `⚠️ Auto-redeem SKIPPED - Proxy wallet requires manual Safe signature: ${message}`
+                );
+                logger.warn(
+                  `Auto redeem skipped for market ${position.market}: ${message}`
+                );
+              } else {
+                console.error('❌ Auto-redeem failed:', error);
+                logger.error(`Auto-redeem failed for market ${position.market}: ${message}`);
+              }
+            }
 
             redeemedMarkets.add(position.market);
             continue;
           }
 
           const bestBidPrice = await this.positions.getBestBidPrice(position.tokenId);
+          if (bestBidPrice < AUTO_SELL_MIN_BID_PRICE) {
+            console.log('bestBid too low');
+            logger.info(
+              `Auto-sell skipped for ${position.tokenId}: bestBid too low (${bestBidPrice.toFixed(4)} < ${AUTO_SELL_MIN_BID_PRICE})`
+            );
+            continue;
+          }
           if (bestBidPrice <= config.trading.autoSellThreshold) {
             continue;
           }
 
+          const availableShares = this.positions.getWinningShares(position.tokenId);
+          if (availableShares < AUTO_SELL_MIN_SHARES) {
+            logger.info(
+              `Auto-sell skipped for ${position.tokenId}: ${availableShares.toFixed(4)} shares < ${AUTO_SELL_MIN_SHARES}`
+            );
+            continue;
+          }
+
+          console.log(
+            `Trying auto-sell ${availableShares.toFixed(4)} shares @ bestBid ${bestBidPrice.toFixed(4)}`
+          );
+          console.log(
+            `[Auto-sell] Found winning position @ ${bestBidPrice.toFixed(2)} > ${config.trading.autoSellThreshold} → selling ${availableShares.toFixed(4)} shares`
+          );
           logger.info(
             `Auto sell triggered for ${position.tokenId}: best bid ${bestBidPrice.toFixed(4)} > ${config.trading.autoSellThreshold}`
           );
 
           await this.executeWithRetry(async () => {
-            await this.executeManagedPositionSell(position);
+            await this.executeManagedPositionSell(position, bestBidPrice, availableShares);
           });
         } catch (error: any) {
           if (error instanceof TradeSkipError) {
@@ -857,10 +903,19 @@ export class Trader {
     };
   }
 
-  private async executeManagedPositionSell(position: PositionState): Promise<void> {
-    const availableShares = this.positions.getWinningShares(position.tokenId);
+  private async executeManagedPositionSell(
+    position: PositionState,
+    observedBestBid?: number,
+    observedShares?: number
+  ): Promise<void> {
+    const availableShares = observedShares ?? this.positions.getWinningShares(position.tokenId);
     if (availableShares <= 0) {
       throw new TradeSkipError(`Auto-sell skipped for ${position.tokenId}: no remaining shares`);
+    }
+    if (availableShares < AUTO_SELL_MIN_SHARES) {
+      throw new TradeSkipError(
+        `Auto-sell skipped for ${position.tokenId}: ${availableShares.toFixed(4)} shares < ${AUTO_SELL_MIN_SHARES}`
+      );
     }
 
     const [orderbook, marketMetadata] = await Promise.all([
@@ -871,57 +926,251 @@ export class Trader {
 
     this.ensureLiquidity(orderbook, 'SELL');
 
-    const bestBidPrice = Number(orderbook?.bids?.[0]?.price || 0);
+    const bestBidPrice = Number(orderbook?.bids?.[0]?.price || observedBestBid || 0);
+    if (bestBidPrice < AUTO_SELL_MIN_BID_PRICE) {
+      throw new TradeSkipError('bestBid too low');
+    }
     if (bestBidPrice <= config.trading.autoSellThreshold) {
       throw new TradeSkipError(
         `Auto-sell skipped for ${position.tokenId}: best bid ${bestBidPrice.toFixed(4)} <= ${config.trading.autoSellThreshold}`
       );
     }
 
-    const validatedPrice = await this.validatePrice(bestBidPrice, position.tokenId);
-    const notional = Math.round(availableShares * validatedPrice * 100) / 100;
+    const gtcPrice = await this.validatePrice(
+      Math.min(bestBidPrice + AUTO_SELL_GTC_OFFSET, 0.99),
+      position.tokenId
+    );
+    const gtcNotional = Math.round(availableShares * gtcPrice * 100) / 100;
 
-    if (notional < MIN_SELL_NOTIONAL_USD) {
+    if (gtcNotional < MIN_SELL_NOTIONAL_USD) {
       throw new TradeSkipError(
-        `Auto-sell skipped for ${position.tokenId}: position notional ${notional.toFixed(2)} < ${MIN_SELL_NOTIONAL_USD}`
+        `Auto-sell skipped for ${position.tokenId}: position notional ${gtcNotional.toFixed(2)} < ${MIN_SELL_NOTIONAL_USD}`
       );
     }
 
-    this.ensureLiquidityDepth(orderbook, 'SELL', notional);
+    this.ensureLiquidityDepth(orderbook, 'SELL', gtcNotional);
 
     logger.info(
-      `   Auto-selling ${availableShares.toFixed(4)} shares of ${position.tokenId} at best bid ${validatedPrice.toFixed(4)}`
+      `   Auto-selling ${availableShares.toFixed(4)} shares of ${position.tokenId} via GTC @ ${gtcPrice.toFixed(4)}`
     );
     logger.info(`   Fee rate bps: ${marketMetadata.feeRateBps}`);
 
-    const response = await this.clobClient.createAndPostMarketOrder(
+    const gtcResponse = await this.clobClient.createAndPostOrder(
       {
         tokenID: position.tokenId,
-        amount: availableShares,
-        price: validatedPrice,
+        price: gtcPrice,
+        size: availableShares,
         side: Side.SELL,
         feeRateBps: marketMetadata.feeRateBps,
-        orderType: OrderType.FOK,
       },
       orderOpts,
-      OrderType.FOK
+      OrderType.GTC
     );
 
-    if (!response.success) {
-      const errorMsg = response.errorMsg || response.error || 'Unknown error';
-      throw new Error(`Auto-sell order failed: ${errorMsg}`);
+    if (!gtcResponse.success) {
+      const errorMsg = gtcResponse.errorMsg || gtcResponse.error || 'Unknown error';
+      throw new Error(`Auto-sell GTC order failed: ${errorMsg}`);
     }
 
-    logger.info(`Auto-sold winning position at ${validatedPrice.toFixed(2)}`);
-    logger.info(`   Auto-sell order ID: ${response.orderID}`);
+    logger.info(`   Auto-sell GTC order ID: ${gtcResponse.orderID}`);
+
+    const gtcProgress = await this.monitorAutoSellGtcOrder(
+      gtcResponse.orderID,
+      position.tokenId,
+      availableShares
+    );
+
+    if (gtcProgress.stillOpen) {
+      await this.cancelAutoSellOrder(gtcResponse.orderID);
+    }
+
+    const refreshedViaGtc = await this.refreshTrackedPositions();
+    const remainingShares = this.positions.getWinningShares(position.tokenId);
+    if (remainingShares < AUTO_SELL_MIN_SHARES) {
+      console.log('✅ Auto-sold via GTC');
+      logger.info(`Auto-sold via GTC for ${position.tokenId}`);
+
+      if (!refreshedViaGtc) {
+        this.positions.recordFill({
+          trade: this.createSyntheticTrade(position, 'SELL', gtcPrice, gtcNotional),
+          notional: gtcNotional,
+          shares: availableShares,
+          price: gtcPrice,
+          side: 'SELL',
+        });
+      }
+      return;
+    }
+
+    const latestOrderbook = await this.clobClient.getOrderBook(position.tokenId);
+    this.ensureLiquidity(latestOrderbook, 'SELL');
+
+    const latestBestBid = Number(latestOrderbook?.bids?.[0]?.price || 0);
+    if (latestBestBid < AUTO_SELL_MIN_BID_PRICE) {
+      throw new TradeSkipError('bestBid too low');
+    }
+
+    const fallbackPrice = await this.validatePrice(
+      this.applySlippage(latestBestBid, 'SELL', config.trading.slippageTolerance),
+      position.tokenId
+    );
+    const fallbackNotional = Math.round(remainingShares * fallbackPrice * 100) / 100;
+
+    if (fallbackNotional < MIN_SELL_NOTIONAL_USD) {
+      throw new TradeSkipError(
+        `Auto-sell fallback skipped for ${position.tokenId}: position notional ${fallbackNotional.toFixed(2)} < ${MIN_SELL_NOTIONAL_USD}`
+      );
+    }
+
+    this.ensureLiquidityDepth(latestOrderbook, 'SELL', fallbackNotional);
+
+    const fallbackResponse = await this.clobClient.createAndPostMarketOrder(
+      {
+        tokenID: position.tokenId,
+        amount: remainingShares,
+        price: fallbackPrice,
+        side: Side.SELL,
+        feeRateBps: marketMetadata.feeRateBps,
+        orderType: OrderType.FAK,
+      },
+      orderOpts,
+      OrderType.FAK
+    );
+
+    if (!fallbackResponse.success) {
+      const errorMsg = fallbackResponse.errorMsg || fallbackResponse.error || 'Unknown error';
+      throw new Error(`Auto-sell fallback MARKET order failed: ${errorMsg}`);
+    }
+
+    console.warn('⚠️ Fallback MARKET sell used');
+    logger.warn(`Fallback MARKET sell used for ${position.tokenId}`);
 
     this.positions.recordFill({
-      trade: this.createSyntheticTrade(position, 'SELL', validatedPrice, notional),
-      notional,
-      shares: availableShares,
-      price: validatedPrice,
+      trade: this.createSyntheticTrade(position, 'SELL', fallbackPrice, fallbackNotional),
+      notional: fallbackNotional,
+      shares: remainingShares,
+      price: fallbackPrice,
       side: 'SELL',
     });
+
+    await this.refreshTrackedPositions();
+  }
+
+  private async monitorAutoSellGtcOrder(
+    orderId: string,
+    tokenId: string,
+    originalShares: number
+  ): Promise<{ stillOpen: boolean }> {
+    const startedAt = Date.now();
+    let heartbeatId = '';
+
+    while (Date.now() - startedAt < AUTO_SELL_GTC_TIMEOUT_MS) {
+      await this.sleep(AUTO_SELL_HEARTBEAT_INTERVAL_MS);
+      heartbeatId = await this.postAutoSellHeartbeat(heartbeatId);
+
+      const openOrder = await this.findOpenAutoSellOrder(orderId, tokenId);
+      if (!openOrder) {
+        return { stillOpen: false };
+      }
+
+      const remainingShares = this.getRemainingSharesFromOrder(openOrder, originalShares);
+      if (remainingShares < AUTO_SELL_MIN_SHARES) {
+        await this.cancelAutoSellOrder(orderId);
+        return { stillOpen: false };
+      }
+    }
+
+    return {
+      stillOpen: Boolean(await this.findOpenAutoSellOrder(orderId, tokenId)),
+    };
+  }
+
+  private async postAutoSellHeartbeat(currentHeartbeatId: string): Promise<string> {
+    const clientAny = this.clobClient as any;
+
+    if (typeof clientAny.postHeartbeat !== 'function') {
+      return currentHeartbeatId;
+    }
+
+    try {
+      const response = await clientAny.postHeartbeat(currentHeartbeatId);
+      return String(response?.heartbeat_id || currentHeartbeatId || '');
+    } catch (error: any) {
+      logger.warn(`Auto-sell heartbeat failed: ${error?.message || 'Unknown error'}`);
+      return currentHeartbeatId;
+    }
+  }
+
+  private async findOpenAutoSellOrder(orderId: string, tokenId: string): Promise<any | undefined> {
+    const clientAny = this.clobClient as any;
+
+    try {
+      let orders: any[] = [];
+
+      if (typeof clientAny.getOpenOrders === 'function') {
+        const response = await clientAny.getOpenOrders({ asset_id: tokenId });
+        orders = Array.isArray(response) ? response : [];
+      } else if (typeof clientAny.getOrders === 'function') {
+        const response = await clientAny.getOrders({ asset_id: tokenId });
+        orders = Array.isArray(response) ? response : [];
+      }
+
+      return orders.find((order) => String(order?.id || order?.orderID || '') === orderId);
+    } catch (error: any) {
+      logger.warn(`Could not inspect auto-sell GTC order ${orderId}: ${error?.message || 'Unknown error'}`);
+      return undefined;
+    }
+  }
+
+  private async cancelAutoSellOrder(orderId: string): Promise<void> {
+    const clientAny = this.clobClient as any;
+
+    try {
+      if (typeof clientAny.cancel === 'function') {
+        await clientAny.cancel(orderId);
+        return;
+      }
+
+      if (typeof clientAny.cancelOrders === 'function') {
+        await clientAny.cancelOrders([orderId]);
+        return;
+      }
+
+      logger.warn(`Auto-sell GTC order ${orderId} could not be cancelled because cancel API is unavailable`);
+    } catch (error: any) {
+      logger.warn(`Could not cancel auto-sell GTC order ${orderId}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  private getRemainingSharesFromOrder(order: any, originalShares: number): number {
+    const originalSize = Number(order?.original_size || order?.originalSize || originalShares);
+    const matchedSize = Number(order?.size_matched || order?.sizeMatched || 0);
+
+    if (!Number.isFinite(originalSize) || originalSize <= 0) {
+      return originalShares;
+    }
+
+    return Math.max(0, originalSize - matchedSize);
+  }
+
+  private async refreshTrackedPositions(): Promise<boolean> {
+    const checkedAddress = getPositionCheckAddress(this.executionContext);
+
+    try {
+      const response = await axios.get(DATA_API_POSITIONS, {
+        params: { user: checkedAddress.toLowerCase(), limit: 500 },
+        headers: { Accept: 'application/json' },
+      });
+
+      const positions = Array.isArray(response.data) ? response.data : [];
+      this.positions.loadFromClobPositions(positions);
+      return true;
+    } catch (error: any) {
+      logger.warn(
+        `Could not refresh tracked positions from Data API for ${checkedAddress}: ${error?.message || 'Unknown error'}`
+      );
+      return false;
+    }
   }
 
   private resolveExecutionSize(
